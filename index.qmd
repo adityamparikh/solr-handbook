@@ -1,0 +1,82 @@
+# Preface {.unnumbered}
+
+This handbook is a current, opinionated, code-first walkthrough of Apache Solr 10 — its internals, indexing pipeline, query layer, distributed runtime (SolrCloud), the Model Context Protocol integration, and the broader search-engine landscape it lives in. Every chapter mixes theory with concrete XML, JSON, and SolrJ Java snippets you can run. Diagrams are written in [Mermaid](https://mermaid.js.org/) and live as text in the source repository.
+
+The book covers Apache Solr 10.0.0 (released 2025) and explicitly calls out differences from Solr 9.x where they affect upgrades. Concepts that have been stable for multiple major versions are presented without version drift; concepts that changed recently are tagged with the JIRA ticket and release in which they landed.
+
+## Who this book is for
+
+This book assumes:
+
+- **You are a working software engineer.** You know Java, HTTP, SQL, and at least one relational database. You have written REST APIs.
+- **You are not a complete beginner with search.** You understand what a search box is and have probably used Elasticsearch or Solr at least casually. If you have never seen an inverted index, [Chapter 1](chapters/01-why-solr.qmd) is for you; the rest of the book builds on it.
+- **You work in a JVM shop.** Code samples are Java/SolrJ. The architectural advice is language-neutral, but the runnable code is not.
+
+It is **not** written for:
+
+- Pure data scientists looking for retrieval-augmented-generation recipes. ([Chapter 5](chapters/05-relevance.qmd) touches relevance engineering, but this is an infrastructure book.)
+- Operators of pre-9.x Solr clusters who need an upgrade-only guide. Major-version migration steps are flagged but not exhaustively documented.
+- Readers expecting Python, Ruby, or Node.js client examples. The patterns transfer; the code does not.
+
+## How to read this book
+
+Chapters 1–4 build on each other and are best read in order. Chapters 5–7 stand alone once that spine is in place.
+
+- **[Chapter 1 — Why Solr](chapters/01-why-solr.qmd)** establishes why a B-tree over `VARCHAR` is the wrong tool for full-text search, walks through the inverted index as it actually lives on disk in a Lucene segment, and ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
+- **[Chapter 2 — Indexing](chapters/02-indexing.qmd)** covers the schema (managed-schema, field types, `copyField`, `dynamicField`, `docValues`, multivalued and dynamic fields), the SolrJ indexing path, partial updates with optimistic concurrency, reindexing strategy, hard vs. soft commits, and segment merging.
+- **[Chapter 3 — Search](chapters/03-search.qmd)** is the query layer: request handlers, queries vs. filters, the Standard / DisMax / eDisMax parsers, field and range facets (JSON Facet API), BM25 in honest detail, vector and hybrid retrieval, suggesters, highlighting, collapse/expand, and how to debug a slow request.
+- **[Chapter 4 — SolrCloud](chapters/04-solrcloud.qmd)** is the distributed runtime: ZooKeeper, shards, NRT/TLOG/PULL replicas, document routing, leader election, the Collections API, the Apache Solr Operator on Kubernetes, and monitoring.
+- **[Chapter 5 — Relevance Engineering](chapters/05-relevance.qmd)** measures and improves what queries return: judgment lists with Quepid and NDCG, the signals plane, learning-to-rank with the `ltr` module, the `relatedness()` aggregation, and editorial overrides with the Query Elevation Component.
+- **[Chapter 6 — Solr MCP](chapters/06-mcp.qmd)** exposes a Solr collection to an LLM through the Model Context Protocol: server architecture, the four MCP primitives, STDIO vs. HTTP transports, OAuth2 security, observability with the LGTM stack, and how to design tools an LLM can use well.
+- **[Chapter 7 — Alternatives](chapters/07-alternatives.qmd)** compares Solr to Elasticsearch and OpenSearch in 2026 — licensing history, architecture, API surface, performance reality, migration considerations, and the MCP servers offered by all three engines (§7.9).
+
+Each chapter opens with a callout box listing its prerequisites and what you will learn. For a single topic, use the [Index](back-matter/book-index.qmd).
+
+## Conventions
+
+- **`Monospaced text`** denotes code, field names, configuration keys, file paths, JIRA tickets, and shell commands.
+- **Production tip — _xxx_.** Blue-bar callouts mark hard-won operational advice that contradicts the obvious default. Read these even if you skim the surrounding prose.
+- **Solr 9 difference — _xxx_.** Green-bar callouts mark behaviour that changed between Solr 9 and Solr 10. Skip these if you are starting fresh on Solr 10.
+- **Citations.** Authoritative references (Apache Solr Reference Guide, JIRA tickets, Lucene Javadoc, published papers) are linked inline on first use and gathered in the [References](back-matter/references.qmd) section at the end of the book.
+- **Figure and table numbering.** Figures and tables are numbered per chapter (`Figure 6.1`, `Table 6.3`) and cross-referenced inline. The PDF, HTML, and EPUB builds all use the same numbering.
+
+## Diagrams
+
+All diagrams are written in [Mermaid](https://mermaid.js.org/) and rendered at build time. They diff cleanly in version control (no binary blobs), survive Markdown → PDF / HTML / EPUB conversion without hand re-rendering, and you can copy any of them into <https://mermaid.live/> to edit and adapt for your own designs.
+
+The diagram style is intentionally consistent:
+
+- **Flowcharts** (`flowchart LR` for left-to-right pipelines, `flowchart TB` for top-down state machines) show data flow and dependency direction.
+- **Sequence diagrams** (`sequenceDiagram`) show wire-level interactions across nodes — used for leader election, distributed query flow, and update sequences.
+- **Box labels** describe *what a thing is*; **arrow labels** describe *what crosses the boundary*. If a label describes an action ("commit", "fan out", "watch fires"), it lives on the arrow, not the box.
+- **Bracket conventions:** `[square brackets]` for processes/components, `(rounded)` for data stores, `((double circles))` for terminal/start states. Same as standard UML/flowchart practice.
+
+When a diagram is dense (e.g., the HNSW graph walk in §3.6), it is intentionally so — the alternative would be three smaller diagrams that don't fit on one page. Read it slowly.
+
+## A note on the title
+
+I chose "Practical Engineering Handbook" deliberately. This is not a reference manual — the official Apache Solr Reference Guide already fills that role excellently and is updated with every release. It is also not a relevance-theory book — *Relevant Search* (Turnbull & Berryman, 2016) and *AI-Powered Search* (Grainger, Turnbull, Irwin, 2025) cover that territory better than I could in one chapter. This book is the missing middle: the operational, code-level, "what do I actually type" companion that takes a working JVM engineer from "I have heard of Solr" to "I have shipped Solr to production."
+
+## Acknowledgements
+
+This book was written with Claude (Anthropic) as a drafting and review partner. All technical claims have been independently verified against the Apache Solr 10 source, the reference guide, and live testing where applicable. Errors are mine.
+
+Thanks to the Apache Solr committers and the Lucene community for two decades of patient stewardship. Thanks to the authors of *Solr in Action*, *Relevant Search*, and *AI-Powered Search* — this book stands on their shoulders.
+
+---
+
+## Copyright and edition {.unnumbered}
+
+**Apache Solr: A Practical Engineering Handbook**
+First edition, May 2026.
+© 2026 Aditya Parikh. Some rights reserved.
+
+This work is licensed under the [Creative Commons Attribution 4.0 International License (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). You may share and adapt the material for any purpose, including commercially, with attribution to the author.
+
+Apache®, Apache Solr™, Apache Lucene™, and Apache ZooKeeper™ are trademarks of the [Apache Software Foundation](https://www.apache.org/). Elasticsearch is a trademark of Elasticsearch B.V. OpenSearch is a trademark of the OpenSearch Software Foundation. All other trademarks are property of their respective owners. Use of trademarks in this book is descriptive only and does not imply endorsement.
+
+- **Code repository:** <https://github.com/adityamparikh/solr-handbook-code> *(planned for v1.0 release)*
+- **Errata and discussion:** <https://github.com/adityamparikh/solr-handbook-code/issues>
+- **Author contact:** aditya.m.parikh@gmail.com
+
+ISBN: not yet assigned (pre-print edition).
