@@ -1,0 +1,395 @@
+# Why Solr?
+
+> **What this chapter covers and why it matters.** Before you adopt any search engine, you should be able to defend, in one paragraph, why a B-tree index over `VARCHAR` columns is *not* the right tool for the job. This chapter builds that intuition with a concrete TV-shows catalog example, walks through the inverted-index data structure as it actually lives on disk in Lucene, and shows step-by-step how each kind of query (term, phrase, prefix, wildcard, fuzzy, range, boolean) is executed against those files. It ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
+>
+> **Prerequisites:** Working knowledge of SQL and B-tree indexes. No prior Solr experience needed.
+>
+> **You will learn:** What an inverted index is, the five data structures inside a Lucene segment, how each Solr query type maps to those structures, the cost model that makes wildcards expensive and term queries cheap, and when Solr is and isn't the right tool.
+>
+> **What you should not skip:** §1.3 (the five data structures). Everything in later chapters refers back to it.
+
+## 1.1 The naive approach: SQL `LIKE`
+
+Imagine a `shows` table with 50 million rows — every TV show ever made, every region, every platform. A user types `stranger things` into your search bar. The naive query is:
+
+```sql
+SELECT id, title, rating
+FROM   shows
+WHERE  title ILIKE '%stranger things%'
+ORDER  BY rating DESC
+LIMIT  20;
+```
+
+This works for a demo and fails in production for four independent reasons:
+
+1. **It cannot use a B-tree index.** B-trees on `title` accelerate prefix matches (`title LIKE 'stranger%'`) but a leading wildcard (`%stranger`) forces a sequential scan. At 50M rows that is hundreds of milliseconds to many seconds.
+2. **It has no notion of relevance.** A show titled `"Stranger Things"` and a show titled `"Stranger in a Strange Land"` are ranked identically — both match the substring. `ORDER BY rating DESC` is a poor proxy for "what the user meant".
+3. **It does not understand language.** A query for `stranger` does not match `Strangers`. `kids` does not match `kid's`. `sci fi` does not match `sci-fi`. There is no stemming, case folding, possessive stripping, or synonym expansion (so a user typing `scifi` will not match `science fiction`).
+4. **It does not understand multi-term intent.** `stranger things` matches the literal substring but a synopsis containing the words separately — `"a stranger arrives and strange things start happening"` — also matches, with no scoring penalty for the gap.
+
+Production search engines solve all four problems with a different data structure: the **inverted index**.
+
+## 1.2 The inverted index, conceptually
+
+A B-tree maps **row → column value**. An inverted index maps **term → list of rows containing that term**. The asymmetry is the entire point.
+
+Three show documents:
+
+| docId | title                                |
+| ----- | ------------------------------------ |
+| 1     | "Stranger Things Season 4"           |
+| 2     | "The Crown Season 6"                 |
+| 3     | "Strange New Worlds"                 |
+
+After lower-casing, tokenizing on whitespace, removing stop words, and stemming (English Porter):
+
+| docId | terms                              |
+| ----- | ---------------------------------- |
+| 1     | stranger, thing, season, 4         |
+| 2     | crown, season, 6                   |
+| 3     | strang, new, world                 |
+
+We "invert" this into a **term dictionary** plus **posting lists**:
+
+```text
+term       df   postings (docId → tf, positions)
+---------  ---  --------------------------------------------
+4          1    1→(1,[4])
+6          1    2→(1,[3])
+crown      1    2→(1,[1])
+new        1    3→(1,[2])
+season     2    1→(1,[3]), 2→(1,[2])
+strang     1    3→(1,[1])
+stranger   1    1→(1,[1])
+thing      1    1→(1,[2])
+world      1    3→(1,[3])
+```
+
+`df` is **document frequency** (how many documents contain the term). For each match Lucene stores `tf` (term frequency in that doc) and optionally positions, payloads, and offsets.
+
+Looking up `stranger` is an `O(log V)` operation in the term dictionary (where V is vocabulary size — typically much smaller than the document count); the posting list itself is a sorted, delta-encoded, block-compressed stream of doc IDs. The conjunction `stranger AND thing` is a **leap-frog intersection** of two sorted streams, skipping with auxiliary skip-lists. The whole operation is fast even at billions of documents. Notice also that Porter stemming maps both `strange` and `strangers` to `strang` — but *not* `stranger`, which stays as its own root (`stranger`). This is a real quirk of the English Porter stemmer and a recurring source of "why didn't my synonym work?" confusion (covered in §2.4).
+
+## 1.3 What's actually in a Lucene index
+
+The conceptual picture above is what every "inverted index in 5 minutes" blog post draws. In practice, a Solr index is more than just term → docs. To answer real queries — with ranking, sorting, faceting, phrase matching, and returning fields to the client — Lucene maintains several different data structures side by side. You don't need to know their on-disk layout to be effective with Solr, but you do need to know **what's there and why**.
+
+### Segments: the unit of storage
+
+A Lucene index is a directory of **segments**. Each segment is a self-contained mini-index, **write-once and immutable**. New documents land in new segments. Deletes mark old documents as tombstones without rewriting them. A background `MergePolicy` periodically consolidates many small segments into fewer larger ones, and physically drops tombstoned docs in the process.
+
+The implication: a Solr "index" is really N independent indexes, and every query runs against all of them in parallel and merges the results. That is also why **lots of tiny segments hurts** — fixed per-segment overhead multiplies.
+
+### The five data structures a Solr query touches
+
+A single segment contains (at least) five distinct structures, each optimized for a different access pattern:
+
+```{mermaid}
+%%| label: fig-01-lucene-segment
+%%| fig-cap: "The five distinct data structures inside one immutable Lucene segment and what each one is optimized for."
+flowchart LR
+    SEG["Lucene Segment"]
+    SEG --> TD["Term Dictionary<br/>sorted, on-disk map of<br/>term → posting list pointer"]
+    SEG --> POST["Postings<br/>sorted lists of doc-ids<br/>per term (+ optional positions)"]
+    SEG --> DV["Doc Values<br/>column-stride forward index<br/>doc-id → field value"]
+    SEG --> SF["Stored Fields<br/>compressed verbatim copy<br/>of doc content"]
+    SEG --> VEC["Vector Index<br/>HNSW graph for KNN<br/>(only if you index vectors)"]
+```
+
+| Structure | Used by | Example access |
+|---|---|---|
+| **Term dictionary** | Almost every query | "Find the entry for `stranger` and tell me where its posting list is." |
+| **Postings** | Every text query | "Give me the sorted doc-ids that contain `stranger`." |
+| **Doc values** | Sorting, faceting, function queries | "For doc 42, what are its `platforms` values?" |
+| **Stored fields** | Returning results to the client | "Return the verbatim `title` and `description` of doc 42." |
+| **Vector index** | Semantic / KNN queries | "Find the 20 vectors closest to this query vector." |
+
+: The five data structures inside a Lucene segment, what each one is for, and an example access pattern. {#tbl-01-lucene-structures}
+
+The term dictionary is **sorted**, which is why prefix queries (`appl*`) are cheap and leading-wildcards (`*pple`) are expensive — covered in §1.4. The posting list for a term is **sorted by doc-id and skip-list-indexed**, which is why `AND`-ing two posting lists ("leap-frog intersection") is fast. Doc values are a **column-store** — one column per field, laid out doc-id by doc-id — which is why faceting and sorting are cheap *when you have `docValues=true`* and brutal when you don't. Stored fields are **compressed in chunks**, which is why returning huge `rows=1000` pages is expensive even when the search itself was fast.
+
+You will see references to specific files (`.tim`, `.doc`, `.dvd`, `.fdt`, `.nvd`, `.vec` etc.) in Solr logs, segment listings, and JIRA tickets. They map directly to the structures above. You almost never need to think about them at that level.
+
+### Deletes are soft
+
+A document is "deleted" by flipping a bit in a per-segment **live-docs bitset**. The doc stays on disk until a merge rewrites the segment. This is why deletes are essentially free at write time and why `numDocs` (live) and `maxDoc` (live + deleted) diverge until merging catches up.
+
+### Going deeper
+
+If you want the actual file format, encoding tricks (FST term index, PFOR-delta posting compression, skip lists), and Lucene codec internals, the canonical references are:
+
+- **Lucene file formats reference** — [`org.apache.lucene.codecs.lucene103` package summary](https://lucene.apache.org/core/10_3_0/core/org/apache/lucene/codecs/lucene103/package-summary.html) (matches the codec used by Solr 10's Lucene 10.3).
+- **Sease blog: Exploring Solr Internals — The Lucene Inverted Index** — [sease.io/2015/07/exploring-solr-internals-lucene.html](https://sease.io/2015/07/exploring-solr-internals-lucene.html).
+- **Michael McCandless's "Changing Bits" blog** — long-running deep dives on Lucene internals at [blog.mikemccandless.com](https://blog.mikemccandless.com).
+- **Jedr Blaszyk: "Exploring Apache Lucene — Part 1: The Index"** — [j.blaszyk.me/tech-blog/exploring-apache-lucene-index/](https://j.blaszyk.me/tech-blog/exploring-apache-lucene-index/).
+
+For the rest of this book, knowing that these five structures exist — and what each is for — is enough.
+
+## 1.4 How each query type actually executes
+
+Now we can walk through the common query types and explain *which files they read* and *why their cost differs*.
+
+### 1.4.1 Term query: `q=platforms:Netflix`
+
+The simplest case.
+
+1. The query string is run through the field's analyzer chain *only if the field has one*. A `solr.TextField` (e.g. `text_en`) lowercases, tokenizes, and stems. A `solr.StrField` does **none** of that — the input bytes are matched against the indexed bytes exactly, case included. So `platforms:Netflix` on a `string` field finds documents indexed with `"Netflix"` but **not** documents indexed with `"netflix"` or `"NETFLIX"`. This catches almost every new Solr user once: facet/sort fields are typically `StrField`, and "why doesn't my platform filter match?" is usually a casing mismatch at index time.
+2. `.tip` lookup → `.tim` block → posting list pointer.
+3. Iterate `.doc` postings; for each, score with BM25 using `.nvd` norms; skip if not in `.liv`.
+
+**Cost:** linear in the number of matching docs. Cheap.
+
+**Production tip — normalize casing at the source.** For facet/filter fields, lowercase (or otherwise canonicalize) in the ingestion layer *before* sending to Solr. Don't try to fix it with a `solr.LowerCaseFilterFactory`-only field type — that path tokenizes, which breaks exact equality matching used by facets. The right pattern is a `StrField` mirror populated by your application code or a `copyField` from a `KeywordTokenizerFactory` + `LowerCaseFilterFactory` pipeline. Either way, the bytes you index and the bytes you query must match.
+
+### 1.4.2 Boolean query: `q=stranger AND things`, `q=stranger OR things`, `q=stranger NOT love`
+
+- **AND** = leap-frog intersection of posting lists (§1.3.2). Cost grows with the *smaller* posting list because the smaller one drives the cursor and the larger one gets skipped.
+- **OR** = priority-queue merge of posting lists. Cost grows with the *sum* of posting-list sizes.
+- **NOT** = AND with the complement; in practice Lucene uses the same iterator framework and just skips matches.
+
+**Practical implication:** put the most selective clause first if you author the query; the optimizer will reorder when it has stats, but the cheapest disjunction is the one with the smallest combined posting list. In a shows corpus `stranger` (rare title term) is far more selective than `things` (common), so the intersection is driven by the much shorter posting list of `stranger`.
+
+### 1.4.3 Phrase query: `q=title:"stranger things"`
+
+Now we need *positions*.
+
+1. Look up both terms (`.tip` + `.tim`) and get their `.doc` *and* `.pos` pointers.
+2. Run the AND intersection as before to find candidate docs.
+3. For each candidate, decode the `.pos` entries for both terms in that doc. Look for a position `p_stranger` and a position `p_things` such that `p_things == p_stranger + 1` (or within `slop` for `"stranger things"~2`).
+4. Score only the docs that pass the position check.
+
+**Cost:** AND intersection cost + position-stream decode per candidate. Phrase is meaningfully more expensive than the underlying AND. **Implication:** index positions only on fields where you need phrase/proximity. The `omitPositions="true"` field-type attribute on `string` and most analytics fields drops `.pos` entirely.
+
+### 1.4.4 Prefix query: `q=title:strang*`
+
+Prefix queries leverage the fact that the term dictionary is **sorted**.
+
+1. Find the first term in the dictionary that starts with `strang`.
+2. Walk forward, collecting terms as long as they start with `strang` — `strange`, `stranger`, `strangers`, `strangely`, `strangelove`, ...
+3. OR all their posting lists together.
+
+```{mermaid}
+%%| label: fig-01-prefix-query-walk
+%%| fig-cap: "How a trailing-wildcard prefix query walks the sorted term dictionary forward and OR-merges the matching posting lists."
+flowchart LR
+    Q["Query: title:strang*"]
+    Q --> SEEK["1- Seek to first term<br/>starting with 'strang'"]
+    SEEK --> SCAN["2- Walk forward<br/>collect: strange, stranger,<br/>strangers, strangely,<br/>strangelove, ...<br/>STOP at first non-matching term"]
+    SCAN --> OR["3- OR-merge posting lists"]
+    OR --> OUT["candidate doc set"]
+```
+
+**Cost:** depends on how many terms share the prefix. `strang*` might match 50 terms; `s*` might match 50,000. Lucene auto-rewrites broad prefix queries into a constant-score form to keep this bounded.
+
+> **Production tip — the `maxBooleanClauses` trap.** Internally a prefix query expands into an OR of all matched terms. Solr caps the clause count (default 1024, configurable in `solrconfig.xml`). Very broad prefixes can throw `TooManyClauses` or silently fall back to a non-scored rewrite. If you intentionally search broad prefixes, either raise the cap or restrict the prefix.
+
+### 1.4.5 Wildcard query: `q=title:t?ings` and the leading-wildcard problem
+
+The `*` (any sequence) and `?` (single character) wildcards share the same execution model as prefix queries, but the cost structure depends entirely on **where the wildcard is**.
+
+Three cases, in order of cost:
+
+**Case 1: Trailing wildcard `q=title:strang*`** — already covered above. Seek to the leading literal, scan forward. Cheap.
+
+**Case 2: Embedded wildcard `q=title:t?ings`** — Lucene seeks to the longest leading literal (here, `t`), then scans every term beginning with `t` and tests each against the wildcard pattern. Same machinery powers regex queries.
+
+**Case 3: Leading wildcard `q=title:*hings`** — the pathological case. There is no leading literal at all, so there is nowhere to seek. Lucene has to scan **every** term in the dictionary and test each against the pattern.
+
+```{mermaid}
+%%| label: fig-01-wildcard-cost
+%%| fig-cap: "Why wildcard cost depends on the leading literal: trailing wildcards scan ~50 terms, embedded ones thousands, and leading wildcards must scan every term in the dictionary."
+flowchart TB
+    subgraph Trailing["Trailing wildcard: strang*"]
+        T1["Seek to 'strang'"] --> T2["Scan forward from there<br/>STOP at first non-match"]
+        T2 --> T3["~50 terms inspected<br/>FAST"]
+    end
+    subgraph Embedded["Embedded wildcard: t?ings"]
+        E1["Seek to 't'"] --> E2["Scan all terms starting with 't'<br/>match each against pattern"]
+        E2 --> E3["~5,000 terms inspected<br/>SLOW-ISH"]
+    end
+    subgraph Leading["Leading wildcard: *hings"]
+        L1["No leading literal"] --> L2["Scan ENTIRE term dictionary<br/>match each against pattern"]
+        L2 --> L3["~10,000,000 terms inspected<br/>VERY SLOW"]
+    end
+```
+
+**Cost summary:** a leading literal of even one character (`t?ings`) keeps wildcard queries manageable on most corpora; a truly leading wildcard (`*hings`) does not.
+
+#### The `ReversedWildcardFilterFactory` fix
+
+If you need leading-wildcard support, the canonical fix is to index every term **twice** — once normally and once reversed. A leading wildcard against the normal form becomes a trailing wildcard against the reversed form, which is fast.
+
+```xml
+<fieldType name="text_rev" class="solr.TextField" positionIncrementGap="100">
+  <analyzer type="index">
+    <tokenizer class="solr.StandardTokenizerFactory"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <!-- Index each term plus its reverse, with a marker character so the
+         query parser can tell them apart. Marker defaults to U+0001. -->
+    <filter class="solr.ReversedWildcardFilterFactory"
+            withOriginal="true"
+            maxPosAsterisk="3"
+            maxPosQuestion="2"
+            maxFractionAsterisk="0.33"/>
+  </analyzer>
+  <analyzer type="query">
+    <tokenizer class="solr.StandardTokenizerFactory"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <!-- Note: do NOT add ReversedWildcardFilter at query time.
+         The query parser detects leading wildcards and rewrites
+         them to use the reversed terms automatically. -->
+  </analyzer>
+</fieldType>
+```
+
+What the parameters mean:
+
+- **`withOriginal=true`** — index both the original term and its reverse (otherwise normal queries break).
+- **`maxPosAsterisk=3`** — only rewrite to use reversed terms if the `*` is within the first 3 characters. Past that, a normal forward scan is cheap enough.
+- **`maxPosQuestion=2`** — same for `?`.
+- **`maxFractionAsterisk=0.33`** — only rewrite if the `*` is within the first third of the query string.
+
+At index time, indexing `"things"` produces two tokens in the inverted index: `things` and `\u0001sgniht` (the marker plus the reverse). At query time, parsing `*hings` triggers the rewrite: Lucene constructs `sgnih*` against the reversed terms and runs it as a fast trailing-wildcard query.
+
+**Trade-off:** index size grows because every term appears twice, and merge throughput drops accordingly. Worth it for fields where leading-wildcard is a real user need; not worth it as a default.
+
+#### When n-grams are a better answer
+
+`ReversedWildcardFilterFactory` solves leading wildcards but not arbitrary infix matching. For "match any substring of a show code or short ID" or "type-ahead with infix" use **n-gram tokenization** instead:
+
+```xml
+<fieldType name="text_ngram" class="solr.TextField">
+  <analyzer type="index">
+    <tokenizer class="solr.StandardTokenizerFactory"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <filter class="solr.NGramFilterFactory" minGramSize="3" maxGramSize="6"/>
+  </analyzer>
+  <analyzer type="query">
+    <tokenizer class="solr.StandardTokenizerFactory"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <!-- query-time is NOT n-gram'd: queries are matched as whole tokens
+         against the indexed n-grams. -->
+  </analyzer>
+</fieldType>
+```
+
+Indexing `"crown"` with min=3 max=6 produces the tokens `cro`, `crow`, `crown`, `row`, `rown`, `own`. A query for `row` now matches without any wildcard at all — it's a regular term query. For prefix-only autocomplete use `EdgeNGramFilterFactory` instead, which only emits prefixes (`c`, `cr`, `cro`, `crow`, `crown`) and avoids the explosion of internal n-grams.
+
+**Trade-off:** n-grams produce 5–10× term volume and similarly grow the index. They eliminate query-time wildcard cost entirely, at the price of larger indexes and slower indexing.
+
+#### Which approach when
+
+| Need | Approach |
+|---|---|
+| Trailing wildcard, occasional use | Plain `text_*` field, no special config |
+| Leading wildcard, occasional use | `ReversedWildcardFilterFactory` on a dedicated field |
+| Infix matching on short fields (show IDs, episode codes like `S04E08`) | `NGramFilterFactory` (min=2, max=4) |
+| Prefix autocomplete / type-ahead | `EdgeNGramFilterFactory` (min=1, max=20) |
+| Substring search on long text | Reconsider — usually a phrase/proximity query is what the user actually wants |
+| Misspelling tolerance | Spell checker (§3.7) or fuzzy `~`, not wildcards |
+
+: Which schema pattern to reach for given the kind of wildcard, substring, or partial-match access you need. {#tbl-01-wildcard-approach}
+
+### 1.4.6 Fuzzy query: `q=title:thinngs~2`
+
+Fuzzy matches all terms within a small edit distance of `thinngs` (a few character insertions, deletions, or substitutions — here the extra `n` is a typo). Internally Lucene uses the term dictionary's sorted structure to enumerate candidate terms efficiently — it does *not* compare against every term one by one. Useful when a user mistypes `breking bad` instead of `breaking bad`.
+
+**Cost:** dominated by how many terms fall within the edit-distance window. Short query terms with `~2` produce huge candidate sets; longer terms produce small ones. Setting `fuzzyPrefixLength=1` or `2` (requiring the first character(s) to match exactly) is the standard way to keep fuzzy queries tractable on large dictionaries.
+
+If you need misspelling tolerance for *user* input, the spell checker (§3.7) is almost always a better answer than fuzzy queries.
+
+### 1.4.7 Range query: `q=release_year:[2015 TO 2020]`
+
+There are two different stories depending on the field type.
+
+**For `string` ranges** (e.g., `id:[A TO M]`): walk the term dictionary forward from the lower bound, OR all postings, stop at the upper bound. Same machinery as prefix.
+
+**For numeric `Point` fields** (`pint`, `pfloat`, `pdate` — default in Solr 9+): the data is **not** in the inverted index at all. Numeric points use a separate indexed structure optimized for range queries. A range query descends to the relevant subtrees and emits matching doc ids directly — much faster than equivalent term ranges, especially for narrow ranges over wide values. This is why the legacy `TrieIntField` was deprecated in favor of `IntPointField`.
+
+If you want the data structure behind point fields, search for "Lucene BKD tree".
+
+### 1.4.8 Function queries: `q={!func}recip(ms(NOW,added_at),...)`
+
+Function queries don't read the inverted index at all — they read **doc values** (the column-store described in §1.3). The function tree is evaluated per doc, producing a score. Typically used as a `boost` rather than a primary query, because they have no candidate-filtering power (every doc "matches" with some score).
+
+### 1.4.9 Vector (KNN) query: `q={!knn f=embedding topK=20}[...]`
+
+Vector queries skip the inverted index entirely. They walk the **HNSW graph** (the vector index from §1.3) to find the top-K nearest neighbors to a query vector. Covered conceptually in Chapter 3.
+
+### 1.4.10 Summary: what each query type uses
+
+| Query type | What it reads | Notes |
+|---|---|---|
+| Term | Term dictionary + postings | Cheap |
+| Boolean (AND/OR/NOT) | Same, for each clause | AND = leap-frog intersection |
+| Phrase / proximity | Adds positions | More expensive than the underlying AND |
+| Prefix | Term dictionary forward scan + postings | `strang*` cheap, `s*` expensive |
+| Wildcard | Same, scoped by leading literal | Leading wildcards (`*hings`) are expensive |
+| Fuzzy | Term dictionary, edit-distance window | Use `fuzzyPrefixLength` to bound cost |
+| Numeric range | Numeric point index (separate structure) | Very fast |
+| String range | Term dictionary forward scan | Like prefix |
+| Function query (boost) | Doc values only | No candidate filtering |
+| Sort / facet | Doc values | Need `docValues=true` to be efficient |
+| KNN | HNSW vector index | Skips the inverted index |
+
+: Which Lucene data structures each Solr query type reads, and the cost notes that follow from it. {#tbl-01-query-type-summary}
+
+Internalizing this table is the difference between guessing about Solr performance and reasoning about it.
+
+## 1.5 BM25 in one paragraph, no math
+
+Each posting contributes a score; the document's score is the sum across query terms. Three intuitive levers control that contribution:
+
+- **Term frequency (TF) with saturation.** Mentioning "stranger" 50 times in a synopsis is not 50× better than mentioning it once. BM25 saturates contribution as TF grows; the `k1` parameter (default `1.2`) controls *where on the curve saturation happens*. Counter-intuitively, **smaller `k1` means TF saturates faster** — the curve flattens sooner, so extra occurrences barely help. Larger `k1` keeps rewarding additional mentions for longer. If you read "k1 controls saturation rate," remember that the relationship is inverse to most people's first guess.
+- **Inverse document frequency (IDF).** Rare terms ("mindhunter") count more than common terms ("season"). `stranger` matching in a corpus where 1% of show titles contain it is far more diagnostic than `the` matching where 99% do.
+- **Length normalization.** A 4-word title `"Stranger Things Season 4"` containing "stranger things" is more relevant than a 2,000-word synopsis that happens to contain the phrase. The `b` parameter (default `0.75`, range `[0, 1]`) controls how aggressively long documents are penalized. `b=0` disables length normalization entirely; `b=1` applies it at full strength. This is the reason for the per-field-per-doc length byte in `.nvd`.
+
+We revisit BM25 with the actual scoring breakdown in Chapter 3.
+
+## 1.6 When to use Solr vs. SQL vs. a vector DB vs. Postgres FTS
+
+| Use case | Pick |
+|---|---|
+| Transactional CRUD; exact lookups; sub-millisecond joins | **Relational DB (Postgres/MySQL)** |
+| Search inside a single Postgres table, < a few million rows, no faceting needs | **Postgres FTS (`tsvector` + GIN)** |
+| Multi-tenant search, faceting, > 50M docs, complex relevance, hybrid lexical+vector | **Solr / OpenSearch / Elasticsearch** |
+| Pure semantic similarity over embeddings, no keyword needs | **Dedicated vector DB (Qdrant, Weaviate, Milvus)** |
+| Logs, metrics, observability | **OpenSearch / Elasticsearch** (mature ecosystem) |
+| Large-scale enterprise search with strict OSS licensing and on-prem | **Solr** |
+
+: A decision matrix for picking between Solr, a relational database, a vector database, and Postgres FTS based on the workload. {#tbl-01-engine-decision}
+
+A useful default for greenfield search products in 2026 is: **Solr if you want full Apache 2.0 + first-class faceting + on-prem control; OpenSearch if you want a richer observability ecosystem; Postgres FTS if your search needs are modest and you already have Postgres.**
+
+## 1.7 PostgreSQL Full-Text Search: a brief comparison
+
+Postgres ships with real full-text search via `tsvector` and `tsquery`:
+
+```sql
+ALTER TABLE shows ADD COLUMN tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || description)) STORED;
+CREATE INDEX shows_tsv_idx ON shows USING GIN (tsv);
+
+SELECT id, title, ts_rank(tsv, q) AS rank
+FROM   shows, websearch_to_tsquery('english', 'stranger things') q
+WHERE  tsv @@ q
+ORDER  BY rank DESC
+LIMIT  20;
+```
+
+This is genuinely good. You get stemming, stop-words, ranking, prefix matching, and indexed performance. Under the hood the `GIN` (Generalized Inverted Index) really is an inverted index — the trade-off is operational, not architectural. What Postgres FTS doesn't give you: faceted navigation with sub-second aggregates over hundreds of millions of documents; horizontal sharding tied to query routing; native vector + lexical hybrid retrieval with rank fusion; pluggable analyzer chains with synonyms, ICU folding, shingles; learning-to-rank and feature stores. For "find blog posts that mention X" Postgres FTS is fine. For "power the search bar of a streaming catalog with 50M shows + episodes across 30 genres and 8 platforms" it is the wrong tool.
+
+## Exercises
+
+1. **Hand-build a posting list.** Take three TV-show titles (any genre, any platform) and produce, by hand: the lowercased tokens for each, the term dictionary (sorted unique terms), and the posting lists with positions. Now answer: which terms have `df=1`? Which would be most diagnostic if a user queried for them?
+2. **Predict the cost.** For each of these queries against a corpus of 50M show records, rank them from cheapest to most expensive *without running them*, and justify your ordering using §1.4: (a) `q=platforms:Netflix`, (b) `q=title:"stranger things"`, (c) `q=title:strang*`, (d) `q=title:*hings`, (e) `q=title:thinngs~2`, (f) `q=release_year:[2015 TO 2020]`. Then, if you have access to a Solr cluster, run them with `debug=timing` and compare your predictions to reality.
+3. **Pick the right tool.** A team wants to add search over a 2-million-row Postgres `episodes` table. Acceptance criteria: support stemming, return results in <200 ms, support boolean queries. Do they need Solr? Justify using §1.6 and §1.7. Now change the requirement to "support 50 simultaneous facet aggregations on genre, platform, release year, and language." Same answer?
+
+## 1.8 Chapter summary
+
+- Search needs a different data structure than transactional storage. The **inverted index** maps term → docs, which makes multi-term, ranked, language-aware retrieval cheap.
+- A Solr index is built from immutable **segments**. Each segment holds five distinct structures: a sorted **term dictionary**, **postings** (sorted doc-id lists per term, with skip lists for fast intersection), **doc values** (a column-store for sorting/faceting/function queries), **stored fields** (compressed verbatim copies for retrieval), and a **vector index** (HNSW graph for KNN).
+- Different query types touch different subsets of these structures. Knowing which structure each query reads is the foundation of reasoning about performance.
+- Solr's value over `LIKE '%...%'` is not "faster substring search" — it is fundamentally different semantics (relevance, language, facets) backed by a fundamentally different storage model.
+- Postgres FTS is a real option for small-to-medium loads; Solr/OpenSearch/Elasticsearch are the right answer when you need scale, facets, or hybrid vector + lexical retrieval.
+
+---
