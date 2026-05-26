@@ -1,0 +1,530 @@
+# Relevance Engineering with Solr
+
+> **What this chapter covers and why it matters.** Chapter 3 taught you how Solr *finds* documents (BM25, eDisMax, vectors, JSON Facets). This chapter is about how you *prove* those documents are the right ones — and how you keep proving it as your corpus, your users, and your business change. In production, "relevance" is not an opinion; it is a measured loop: judge → retrieve → log → boost or rerank → A/B test → deploy. Every section below slots into that loop.
+>
+> **Prerequisites:** Chapter 2 (schemas, atomic and in-place updates, aliases) and Chapter 3 (eDisMax, scoring, function queries). §5.2 reuses the in-place update mechanic from §2.8.2; §5.3 builds on the eDisMax `boost` parameter from §3.2.
+>
+> **You will learn:** How to measure relevance with a judgment list, NDCG@10, and Quepid; how to log and aggregate user signals into a sibling collection; how to apply signals as boosts for head queries; how to use Solr's built-in `ltr` module for learning-to-rank reranking; how to use the `relatedness()` aggregation for query expansion and content discovery; and how to layer editorial overrides on top of all of the above.
+>
+> **What you should not skip:** §5.1 (measurement — without numbers, the rest of the chapter is theatre) and §5.3 (signals boosting — the highest-ROI relevance technique most teams haven't shipped).
+>
+> The first four sections compress the practical core of *AI-Powered Search* (Grainger, Turnbull, Irwin — Manning, 2025) into the minimum a Solr engineer needs to be dangerous. §5.5 covers Solr's built-in `relatedness()` aggregation (SOLR-9480) for ad-hoc relationship mining. §5.6 covers editorial overrides — the manual sibling of automated boosting.
+
+```{mermaid}
+%%| label: fig-05-relevance-loop
+%%| fig-cap: "The end-to-end relevance loop: retrieve, rerank, log signals, aggregate, boost, judge, and feed model training back into the LTR reranker."
+flowchart LR
+    Q[User query] --> R["BM25 / hybrid retrieve<br/>top 500"]
+    R --> LTR["LTR rerank<br/>{!ltr model=...}<br/>top 50"]
+    LTR --> UI[SERP]
+    UI -->|click, purchase| LOG[(signals<br/>collection)]
+    LOG --> AGG["Aggregation job<br/>Streaming Expression"]
+    AGG --> SIG[(signals_aggr<br/>collection)]
+    SIG --> BOOST[Query-time<br/>signals boost]
+    BOOST -.-> R
+    LOG --> JL[(Judgment list)]
+    JL --> EVAL["NDCG@10 in CI<br/>+ Quepid"]
+    EVAL --> TRAIN[Train LTR model]
+    TRAIN --> LTR
+```
+
+## 5.1 Measuring relevance: judgment lists, NDCG, and Quepid
+
+A *judgment list* is a CSV of `(query, doc_id, grade)` rows — typically grades `0..3` — that defines "good" for your domain. With judgments you can compute offline metrics: **NDCG@k** (graded relevance, position-discounted, normalized to 1.0; the industry default), **MRR** (reciprocal rank of the first relevant result; use when there is one right answer), and **MAP** (mean of average precisions across queries; binary relevance, rewards finding *all* relevant docs early). **Quepid** is the open-source workbench from OpenSource Connections (Apache 2.0, [github.com/o19s/quepid](https://github.com/o19s/quepid)) that holds your judgment book, runs queries against any Solr/OpenSearch/Elasticsearch endpoint, and shows the metric delta as you tune.
+
+Without numbers, every relevance argument becomes a HiPPO argument — Highest-Paid Person's Opinion. A 150-query judgment list with grades from two domain raters is enough to detect a 2–3 point NDCG@10 regression *before* it hits production. This is the only honest gate for shipping a schema change, a new analyzer, or an LTR model.
+
+### Implementation: NDCG@k in SolrJ
+
+Score a judgment list against a live collection from Java. The implementation is intentionally explicit so you can drop it into a CI job.
+
+```java
+public final class NdcgEvaluator {
+
+    record Judgment(String query, String docId, int grade) {}
+
+    public static void main(String[] args) throws Exception {
+        List<String> solrUrls = List.of("http://solr-0:8983/solr","http://solr-1:8983/solr");
+        try (var solr = new CloudSolrClient.Builder(solrUrls)
+                .withDefaultCollection("shows").build()) {
+
+            Map<String, List<Judgment>> byQuery = loadJudgments("judgments.csv")
+                .stream().collect(Collectors.groupingBy(Judgment::query));
+
+            double sum = 0;
+            for (var e : byQuery.entrySet()) {
+                var q = new SolrQuery(e.getKey()).setRows(10).setFields("id");
+                List<String> ranked = solr.query(q).getResults().stream()
+                    .map(d -> (String) d.getFieldValue("id")).toList();
+                sum += ndcg(ranked, e.getValue(), 10);
+            }
+            System.out.printf("NDCG@10 = %.4f over %d queries%n",
+                sum / byQuery.size(), byQuery.size());
+        }
+    }
+
+    static double ndcg(List<String> ranked, List<Judgment> judged, int k) {
+        Map<String,Integer> grade = judged.stream()
+            .collect(Collectors.toMap(Judgment::docId, Judgment::grade, (a,b)->a));
+        double dcg = 0;
+        for (int i = 0; i < Math.min(k, ranked.size()); i++) {
+            int g = grade.getOrDefault(ranked.get(i), 0);
+            dcg += (Math.pow(2, g) - 1) / (Math.log(i + 2) / Math.log(2));
+        }
+        List<Integer> ideal = judged.stream().map(Judgment::grade)
+            .sorted(Comparator.reverseOrder()).limit(k).toList();
+        double idcg = 0;
+        for (int i = 0; i < ideal.size(); i++) {
+            idcg += (Math.pow(2, ideal.get(i)) - 1) / (Math.log(i + 2) / Math.log(2));
+        }
+        return idcg == 0 ? 0 : dcg / idcg;
+    }
+}
+```
+
+> **Production tip — wire this into CI.** Run the evaluator in Jenkins/GitHub Actions on every PR that touches schema, analyzers, or solrconfig. Fail the build on a >1% NDCG@10 regression on a frozen "regression suite" of 100–300 queries; allow larger swings on a separate "exploration suite." Two suites, two thresholds — otherwise every legitimate relevance experiment looks like a regression.
+
+> **Production tip — point Quepid at staging.** Quepid issues queries on every keystroke as raters work. Running it against prod doubles your search traffic and skews your own signals (§5.2). Always run Quepid against a staging Solr endpoint with `q.op` and default parameters matching production.
+
+**AIPS reference.** Chapter 4 ("Crowdsourced relevance") for the philosophy of judgments; Chapter 10 §10.2 for how the same list feeds Learning to Rank; Chapter 11 §11.1 for *implicit* judgments derived from clicks.
+
+## 5.2 The signals plane: collection schema and aggregation
+
+A *signal* is any logged user event tied to a document — `query`, `click`, `add_to_cart`, `purchase`, `dwell_ms`. By convention (Lucidworks Fusion, *AI-Powered Search* Chapter 8, and most production Solr deployments) signals live in a sibling collection named `<primary>_signals`, and *aggregated* signals — one row per `(query, doc, action)` with a count and a weight — live in `<primary>_signals_aggr`. Aggregation is a periodic job, not a real-time process: typically a Streaming Expression that runs every 15 minutes to an hour.
+
+Raw clicks are too sparse and too noisy to query at search time. The aggregation collection is the materialized view that the *signals boosting* (§5.3) and *LTR feature logging* (§5.4) stages both depend on. Without §5.2, §5.3 and §5.4 cannot happen.
+
+### Schema for the `_signals` collection
+
+```xml
+<field name="id"          type="string"  indexed="true"  stored="true" required="true"/>
+<field name="type"        type="string"  indexed="true"  stored="true"/>
+                                          <!-- "click" | "query" | "purchase" | "add_to_cart" -->
+<field name="query_s"     type="string"  indexed="true"  stored="true" docValues="true"/>
+<field name="doc_id"      type="string"  indexed="true"  stored="true" docValues="true"/>
+<field name="user_id"     type="string"  indexed="true"  stored="true" docValues="true"/>
+<field name="position_i"  type="pint"    indexed="true"  stored="true" docValues="true"/>
+<field name="timestamp"   type="pdate"   indexed="true"  stored="true" docValues="true"/>
+<field name="filters_ss"  type="strings" indexed="true"  stored="true" docValues="true"/>
+```
+
+### Logging from your search API in SolrJ
+
+```java
+public void logClick(SolrClient solr, String query, String docId,
+                     String userId, int position, List<String> filters)
+        throws Exception {
+    SolrInputDocument s = new SolrInputDocument();
+    s.addField("id",         UUID.randomUUID().toString());
+    s.addField("type",       "click");
+    s.addField("query_s",    query.toLowerCase(Locale.ROOT).trim());
+    s.addField("doc_id",     docId);
+    s.addField("user_id",    userId);
+    s.addField("position_i", position);
+    s.addField("timestamp",  Instant.now().toString());
+    s.addField("filters_ss", filters);
+    solr.add("shows_signals", s);          // autoCommit handles durability
+}
+```
+
+### Aggregation via Streaming Expression — two passes
+
+Run hourly. There are **two passes**: the rollup produces raw counts, and a second pass enriches each document with a `weight_d` that downstream consumers actually use.
+
+The `_signals_aggr` schema:
+
+```xml
+<field name="id"        type="string" indexed="true"  stored="true"  required="true"/>
+<field name="query_s"   type="string" indexed="true"  stored="true"  docValues="true"/>
+<field name="doc_id"    type="string" indexed="true"  stored="true"  docValues="true"/>
+<field name="count_i"   type="pint"   indexed="true"  stored="true"  docValues="true"/>
+<field name="weight_d"  type="pdouble" indexed="false" stored="false" docValues="true"/>
+<!-- weight_d is indexed=false stored=false docValues=true so the in-place update
+     path (§2.8.2) can rewrite it without reindexing the whole document. -->
+```
+
+**Pass 1 — roll up raw counts.** A `select` Streaming Expression with a `rollup` produces one row per `(query, doc)` pair. The `id` is computed deterministically so subsequent runs *upsert* instead of duplicating:
+
+```text
+update(shows_signals_aggr, batchSize="500",
+  select(
+    rollup(
+      search(shows_signals,
+             q="type:click AND timestamp:[NOW-7DAYS TO NOW]",
+             fl="query_s,doc_id",
+             sort="query_s asc, doc_id asc",
+             qt="/export"),
+      over="query_s,doc_id",
+      count(*)),
+    query_s, doc_id,
+    count(*) as count_i,
+    concat(fields="query_s,doc_id", delim="|") as id))
+```
+
+**Pass 2 — enrich with `weight_d` as an in-place update.** Apply your dampening function. The cleanest approach is to compute the weight in your application code and issue per-row in-place updates against `_signals_aggr`. Because `weight_d` is `indexed=false stored=false docValues=true`, this is a true in-place update (§2.8.2) — no reindex, no analyzer chain, microseconds per row:
+
+```java
+// Pass 2 in Java, run after pass 1 commits.
+QueryResponse rows = solr.query("shows_signals_aggr",
+    new SolrQuery("*:*").setRows(50_000)
+        .setFields("id,query_s,count_i")
+        .addSort("query_s", SolrQuery.ORDER.asc)
+        .addSort("count_i", SolrQuery.ORDER.desc));
+
+// Group by query_s to compute per-query max for normalization.
+Map<String, Long> maxByQuery = new HashMap<>();
+for (SolrDocument d : rows.getResults()) {
+    maxByQuery.merge((String) d.get("query_s"),
+                     ((Number) d.get("count_i")).longValue(), Math::max);
+}
+
+List<SolrInputDocument> batch = new ArrayList<>(1_000);
+for (SolrDocument d : rows.getResults()) {
+    long count = ((Number) d.get("count_i")).longValue();
+    long max   = maxByQuery.get((String) d.get("query_s"));
+    double w   = Math.log1p(count) / Math.log1p(max);
+
+    SolrInputDocument upd = new SolrInputDocument();
+    upd.addField("id", d.get("id"));
+    upd.addField("weight_d", Map.of("set", w));   // in-place update
+    batch.add(upd);
+    if (batch.size() == 1_000) { solr.add("shows_signals_aggr", batch); batch.clear(); }
+}
+if (!batch.isEmpty()) solr.add("shows_signals_aggr", batch);
+solr.commit("shows_signals_aggr");
+```
+
+After both passes, each `_signals_aggr` document has the shape `{id, query_s, doc_id, count_i, weight_d}`, and the §5.3 boosting code can read `weight_d` directly.
+
+> **Production tip — normalize on write.** Always lowercase + trim `query_s` on the way in. Half of the "head query" tail you'll see in week one is just casing variants of `"stranger things"` vs. `"Stranger Things"` vs. `"  STRANGER THINGS  "`. Also store `position_i` — without it, you can't apply any position-bias correction later.
+
+> **Production tip — tune commit policy for write-heavy, read-rare.** On `_signals`, set `autoCommit` with `openSearcher=false` plus a separate `autoSoftCommit` of ~60s. Hard-commit every 15 minutes. You're write-heavy and read-rare on this collection; don't pay the NRT visibility cost on every click.
+
+**AIPS reference.** Chapter 4 ("Crowdsourced relevance") for the signals taxonomy; Chapter 8 §8.1 ("Basic signals boosting") for the aggregation contract.
+
+## 5.3 Signals boosting: head queries and the index-time vs. query-time tradeoff
+
+Take the aggregated weights from §5.2 and use them to push popular documents up for the *specific query that produced the popularity*. AIPS frames this as the lowest-cost, highest-ROI lever in the entire relevance toolbox, because for **head queries** — the ~1% of unique queries that drive ~50% of traffic — you already have enough signal to dominate BM25.
+
+A correctly-tuned signals boost typically delivers a 5–15% NDCG@10 lift on head queries with zero ML infrastructure. It is the single best thing you can ship before LTR.
+
+### Query-time boost via the API layer
+
+The most flexible pattern: compute boosts in your search API with one fast lookup against `_signals_aggr`, then pass them as the `boost` parameter (eDisMax multiplicative boost).
+
+```java
+QueryResponse aggr = solr.query("shows_signals_aggr",
+    new SolrQuery("query_s:\"" + ClientUtils.escapeQueryChars(userQuery.toLowerCase()) + "\"")
+        .setFields("doc_id,weight_d")
+        .setRows(50));
+
+String boostExpr = aggr.getResults().stream()
+    .map(d -> String.format("if(termfreq(id,'%s'),%.3f,0)",
+            d.get("doc_id"),
+            ((Number) d.get("weight_d")).doubleValue()))
+    .collect(Collectors.joining(",", "sum(", ")"));
+
+SolrQuery q = new SolrQuery(userQuery)
+    .setRequestHandler("/select");
+q.set("defType", "edismax");
+q.set("qf", "title^3 cast^2 description^1");
+q.set("boost", boostExpr);                      // multiplicative
+QueryResponse rsp = solr.query("shows", q);
+```
+
+This pattern scales because: (a) the `_signals_aggr` lookup is cheap and cacheable; (b) `boost` is evaluated only against the documents BM25 already matched; (c) you can A/B test new boost expressions without redeploying Solr.
+
+### Query-time boost via `{!join}` (smaller collections only)
+
+For small `_signals_aggr` collections, you can skip the API-layer lookup and join directly:
+
+```java
+q.set("bq",
+  "{!join from=doc_id to=id fromIndex=shows_signals_aggr score=max}" +
+  "query_s:\"" + ClientUtils.escapeQueryChars(userQuery.toLowerCase()) + "\"" +
+  "^{!func}weight_d");
+```
+
+This works but doesn't scale past a few million signal docs. Stick with the API-layer pattern for production.
+
+### Index-time alternative
+
+Materialize per-`(query, doc)` boost into the main `shows` collection as a multi-valued payload field, e.g. `signals_boost:"stranger things|2.3 stranger|1.1"`. Use Solr's `DelimitedPayloadTokenFilterFactory` and the `payload()` function in a `bf`. This eliminates the per-request lookup but forces a reindex whenever weights change — fine for nightly batches, painful for hourly.
+
+The operational rule of thumb: **if your aggregation cadence is faster than your reindex cadence, stay query-time.** Move only the long-stable head (queries that haven't changed their top-10 in two weeks) to index-time.
+
+> **Production tip — cap the magnitude.** Cap any single signal boost at roughly 2× the BM25 max-score for the query. Otherwise one viral show owns the SERP and you create a feedback loop that buries new releases. AIPS calls this "the Matthew effect"; engineers call it "the popularity death spiral."
+
+**AIPS reference.** Chapter 8 in full — especially §8.1 ("Basic signals boosting"), §8.3 ("Fighting signal spam"), and §8.6 ("Index-time vs. query-time boosting: balancing scale vs. flexibility").
+
+## 5.4 Learning to Rank with Solr's `ltr` module
+
+The `ltr` module ships with Solr; enable with `-Dsolr.modules=ltr -Dsolr.ltr.enabled=true`. It runs a machine-learned reranker against the top *N* documents from your BM25/hybrid retrieve. There are three moving parts:
+
+- A **feature store** (managed JSON describing features — Solr queries, field values, external inputs).
+- A **model store** (managed JSON containing the trained model — typically `LinearModel` or `MultipleAdditiveTreesModel`).
+- The `{!ltr}` rerank parser, invoked via the `rq=` query parameter.
+
+BM25 is one signal. LTR lets you combine 30+ signals — text similarity, recency, IMDb rating, popularity from §5.2, "watched-something-similar" personalization vectors — into a single learned scoring function. The rerank pattern means you pay the LTR cost on only the top ~100–500 docs per query (typically 5–20 ms), not on the full corpus.
+
+### Enabling LTR in `solrconfig.xml`
+
+```xml
+<queryParser name="ltr" class="org.apache.solr.ltr.search.LTRQParserPlugin"/>
+
+<transformer name="features"
+             class="org.apache.solr.ltr.response.transform.LTRFeatureLoggerTransformerFactory"/>
+
+<cache name="QUERY_DOC_FV"
+       class="solr.search.CaffeineCache"
+       size="4096"
+       initialSize="1024"
+       autowarmCount="0"
+       regenerator="solr.NoOpRegenerator"/>
+```
+
+### Defining a feature store
+
+POST to `/schema/feature-store`:
+
+```json
+[
+  { "name": "originalScore",
+    "class": "org.apache.solr.ltr.feature.OriginalScoreFeature",
+    "store": "v1" },
+  { "name": "titleMatch",
+    "class": "org.apache.solr.ltr.feature.SolrFeature",
+    "params": { "q": "{!field f=title}${user_query}" },
+    "store": "v1" },
+  { "name": "popularity",
+    "class": "org.apache.solr.ltr.feature.FieldValueFeature",
+    "params": { "field": "popularity" },
+    "store": "v1" },
+  { "name": "rating",
+    "class": "org.apache.solr.ltr.feature.FieldValueFeature",
+    "params": { "field": "rating" },
+    "store": "v1" },
+  { "name": "isOngoing",
+    "class": "org.apache.solr.ltr.feature.SolrFeature",
+    "params": { "fq": ["status:ongoing"] },
+    "store": "v1" }
+]
+```
+
+### Uploading a model
+
+POST to `/schema/model-store`. Start with `LinearModel` — it's debuggable. Graduate to `MultipleAdditiveTreesModel` (LambdaMART-style) once you have ≥10k labeled examples:
+
+```json
+{ "store": "v1",
+  "name": "shows_v1",
+  "class": "org.apache.solr.ltr.model.LinearModel",
+  "features": [
+    { "name": "originalScore" },
+    { "name": "titleMatch" },
+    { "name": "popularity" },
+    { "name": "rating" },
+    { "name": "isOngoing" }
+  ],
+  "params": {
+    "weights": {
+      "originalScore": 0.5,
+      "titleMatch":    1.2,
+      "popularity":    0.3,
+      "rating":        0.4,
+      "isOngoing":     1.0
+    }
+  } }
+```
+
+### Reranking from SolrJ
+
+```java
+SolrQuery q = new SolrQuery(userQuery)
+    .setRows(20);
+q.set("rq", "{!ltr model=shows_v1 reRankDocs=200 efi.user_query=\""
+            + userQuery + "\"}");
+q.setFields("id,title,score,[features store=v1 efi.user_query=\"" + userQuery + "\"]");
+QueryResponse rsp = solr.query("shows", q);
+```
+
+### Feature-logging-only mode
+
+For extracting training data, log features without actually reranking by using a no-op model or `reRankDocs=1`:
+
+```text
+q=stranger&rq={!ltr model=shows_v1 reRankDocs=1}&fl=id,score,[features efi.user_query=stranger]
+```
+
+Combine the resulting feature vectors with the implicit judgments from your signals collection to assemble an LTR training set.
+
+> **Production tip — `reRankDocs` is per-shard.** With 4 shards and `reRankDocs=200`, you actually rerank 800 docs. Watch the latency curve carefully; past ~500 effective docs reranked with a 50-tree model, p99 latency hockey-sticks.
+
+> **Production tip — reload after upload.** The feature store and model store are *managed resources*. Per the Solr 10 reference guide, changes are not applied to active components until the collection is reloaded. Script the reload step into your model-deploy pipeline.
+
+> **Production tip — always include `originalScore`.** It anchors the model to BM25 and prevents catastrophic degradation when features are missing (e.g., a brand-new doc with no popularity signal yet).
+
+**AIPS reference.** Chapter 10 ("Learning to rank for generalizable search relevance") — §10.3 ("Feature logging and engineering"), §10.5 ("Training and testing the model"), §10.6 ("Upload a model and search"). Solr reference: `query-guide/learning-to-rank.html`.
+
+## 5.5 The `relatedness()` aggregation — Solr's built-in Semantic Knowledge Graph
+
+Per the Solr 7.4 release notes: *"SOLR-9480: A new 'relatedness()' aggregate function for JSON Faceting to enable building Semantic Knowledge Graphs."* The contribution from Trey Grainger and Chris M. Hostetter added a JSON Facet aggregation that scores how strongly any term — or facet bucket — is associated with a *foreground* document set versus a *background* set. Effectively, every inverted-index term becomes a node, and edges materialize on demand from corpus statistics. A knowledge graph for free, with no extra index.
+
+This is the only crowdsourced-relevance technique that lives *inside* Solr itself, with zero external infrastructure. Use it for query expansion ("what genres co-occur with `stranger things` but not with everything?"), "more like this" widgets, "if you liked X, you might like Y" recommendations, and faceted *content* discovery beyond simple counts.
+
+### Implementation
+
+For our shows catalog: "what genres are most characteristic of shows that share a creator with *Stranger Things* (i.e., the Duffer Brothers)?" The foreground set is shows created by the Duffer Brothers; the background is everything.
+
+```json
+POST /solr/shows/query
+{
+  "query": "*:*",
+  "limit": 0,
+  "facet": {
+    "related_genres": {
+      "type":  "terms",
+      "field": "genres",
+      "limit": 10,
+      "sort":  "r desc",
+      "facet": {
+        "r": "relatedness($fg,$bg)"
+      }
+    }
+  },
+  "params": {
+    "fg": "creator:\"The Duffer Brothers\"",
+    "bg": "*:*"
+  }
+}
+```
+
+Each bucket returns `{count, r: {relatedness, foreground_popularity, background_popularity}}`. Sort descending on `r.relatedness` and you have, in one query, the genres most distinctive to Duffer-Brothers shows relative to the entire catalog (`sci-fi`, `horror`, `supernatural` will rank high; `period`, `romance` will not).
+
+A more useful production query — "what other shows are most associated with viewers who watch Netflix sci-fi shows?":
+
+```json
+{
+  "query": "*:*",
+  "limit": 0,
+  "facet": {
+    "related_shows": {
+      "type":  "terms",
+      "field": "cast_str",
+      "limit": 20,
+      "sort":  "r desc",
+      "facet": { "r": "relatedness($fg,$bg)" }
+    }
+  },
+  "params": {
+    "fg": "platforms:Netflix AND genres:sci-fi",
+    "bg": "*:*"
+  }
+}
+```
+
+From SolrJ via `JsonQueryRequest`:
+
+```java
+var req = new JsonQueryRequest()
+    .setQuery("*:*")
+    .setLimit(0)
+    .withParam("fg", "creator:\"The Duffer Brothers\"")
+    .withParam("bg", "*:*")
+    .withFacet("related_genres", Map.of(
+        "type",  "terms",
+        "field", "genres",
+        "limit", 10,
+        "sort",  "r desc",
+        "facet", Map.of("r", "relatedness($fg,$bg)")));
+QueryResponse rsp = req.process(solr, "shows");
+```
+
+> **Production tip — filter rare terms.** Add `"min_popularity": 0.001` to the `relatedness()` call to drop ultra-rare terms whose Z-score is statistically meaningless (added in SOLR-12581, shipped in Solr 7.7).
+
+> **Production tip — `docValues="true"` required.** `relatedness()` requires `docValues="true"` on the faceted field. If your field is `indexed`-only, you'll get a runtime error or silently wrong counts on multi-shard collections.
+
+**AIPS reference.** Chapter 5 ("Knowledge graph learning") — the entire chapter is built on this primitive. Original paper: Grainger, AlJadda, Korayem, Smith, "The Semantic Knowledge Graph," IEEE DSAA 2016 (arXiv:1609.00464).
+
+## 5.6 Editorial overrides with the Query Elevation Component
+
+Every commercial streaming service eventually needs the "when the user types `stranger things`, the new season of *Stranger Things* is result #1, full stop, and we are not relying on BM25 to figure that out" lever. LTR cannot do this reliably; signals boosting only gets you most of the way. The `QueryElevationComponent` (`solr.QueryElevationComponent`) is Solr's built-in answer: an editorial pin/exclude list keyed on the query string, applied *after* all other scoring.
+
+### Configuration in `solrconfig.xml`
+
+```xml
+<searchComponent name="elevator" class="solr.QueryElevationComponent">
+  <str name="queryFieldType">string</str>
+  <str name="config-file">elevate.xml</str>
+</searchComponent>
+
+<requestHandler name="/select" class="solr.SearchHandler">
+  <lst name="defaults">
+    <str name="echoParams">explicit</str>
+  </lst>
+  <arr name="last-components">
+    <str>elevator</str>
+  </arr>
+</requestHandler>
+```
+
+### `elevate.xml` in the configset
+
+```xml
+<elevate>
+  <query text="stranger things">
+    <doc id="ST-001" />
+  </query>
+  <query text="the office">
+    <doc id="TO-001"  />            <!-- Pin the US version first -->
+    <doc id="FLG-001" />            <!-- UK version second -->
+  </query>
+  <query text="star wars">
+    <doc id="AND-001" />            <!-- Editorial: critically acclaimed -->
+    <doc id="TM-001"  />
+    <doc id="LK-001"  />
+  </query>
+</elevate>
+```
+
+### Runtime override and UI badging
+
+You can also elevate or exclude at request time without changing `elevate.xml`:
+
+```text
+q=stranger things&elevateIds=ST-001&excludeIds=MH-001
+```
+
+And surface the override in your UI using document transformers:
+
+```text
+fl=id,title,rating,[elevated],[excluded]
+```
+
+`[elevated]` returns `true` for documents pinned by the elevator — perfect for a "Featured" or "Sponsored" badge.
+
+> **Production tip — store editorial rules outside the configset.** `elevate.xml` in the configset means every editorial change forces a configset reload. For a fast-moving editorial team, host the rules in a small admin app that writes `elevateIds`/`excludeIds` directly on each request from a database — same outcome, no Solr restart.
+
+**Solr in Action reference.** Chapter 16 §16.3 (boost-based overrides — the modern API is the runtime `elevateIds=` form documented here).
+
+## Exercises
+
+1. **Build a judgment list.** Pick 20 head queries for any domain you care about (try TV shows: "comedy", "sci-fi", "british crime drama", "new on netflix", etc.). For each, run them against a real Solr instance (or any search engine), and grade the top 5 results 0–3. Compute NDCG@5 using the formula in §5.1. Now change one piece of the schema (e.g., add a phrase boost on title) and recompute. Did it move?
+2. **Aggregate signals end to end.** Write the Streaming Expression that takes 30 days of `click` events from `shows_signals` and produces a `shows_signals_aggr` collection with `count_i` and `weight_d`. Use the two-pass pattern from §5.2. Verify that `weight_d` is in `[0, 1]` and that the heaviest-clicked show for each query has `weight_d = 1.0`.
+3. **Cap the boost.** Write the API-layer code (§5.3) that loads signals for a query, but applies a cap so no single document's boost exceeds 2× the BM25 max-score returned by a probe query. Why is the unbounded version dangerous in a content recommendation context?
+4. **Pick LTR features.** For a TV-shows search service, propose five LTR features beyond `originalScore`: two text features (`SolrFeature`), two field-value features (`FieldValueFeature`), and one query-dependent feature using `efi.user_query`. Justify each.
+
+## 5.7 Chapter summary
+
+You can run the entire relevance loop on stock Solr 10 with no external ML platform:
+
+- **Measure** with a small judgment list and NDCG@10 in CI; use Quepid for the human rating workflow.
+- **Log** every query and click into `<collection>_signals`; aggregate hourly into `<collection>_signals_aggr` with Streaming Expressions.
+- **Boost** head queries query-time first, index-time only when stable. Cap boost magnitude to avoid feedback loops.
+- **Rerank** the top 200 with the `ltr` module. Start with `LinearModel` plus `originalScore` as an anchor feature.
+- **Discover** related terms and content with the `relatedness()` aggregation — no extra service required.
+- **Override** with `QueryElevationComponent` when editorial trumps algorithm.
+
+The non-obvious lesson: every box above is a *Solr feature* or a *thin job over a Solr collection*. The relevance loop does not require a separate vector DB, a separate feature store, or a separate ML platform. Build the loop first; only then ask which boxes deserve to graduate to a dedicated system.
+
+---
