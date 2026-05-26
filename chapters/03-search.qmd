@@ -1,0 +1,820 @@
+# Search
+
+> **What this chapter covers and why it matters.** This is where the user's experience is actually made or broken. We will walk the query lifecycle, the parsers, faceting, scoring (BM25 in honest detail), vector search with `DenseVectorField` and the `knn` query parser, hybrid retrieval, spell checking, and highlighting — all with concrete SolrJ code.
+>
+> **Prerequisites:** Chapter 1 (inverted index, query types, cost model) and Chapter 2 (you need a schema and an index to query against).
+>
+> **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search and HNSW work, with a worked cosine-similarity example; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
+>
+> **What you should not skip:** §3.5 (BM25 in honest detail) and §3.6 (vector search and hybrid retrieval — the future of every search bar).
+
+## 3.1 Query anatomy
+
+A Solr query is a set of HTTP parameters. The important ones:
+
+| Param | Meaning | Example |
+|---|---|---|
+| `q` | The main query (scored) | `q=stranger things` |
+| `fq` | Filter queries (not scored, cached) | `fq=status:ongoing&fq=platforms:Netflix` |
+| `fl` | Field list to return | `fl=id,title,rating,score` |
+| `sort` | Sort spec | `sort=score desc, rating desc` |
+| `start`, `rows` | Pagination | `start=0&rows=20` |
+| `defType` | Query parser | `defType=edismax` |
+| `wt` | Response writer | `wt=json` (default) |
+| `debugQuery` | Show parsed query + scoring | `debugQuery=true` |
+
+: The core Solr query parameters every search request is built from, with what each one controls and a concrete example. {#tbl-03-query-anatomy}
+
+```{mermaid}
+%%| label: fig-03-query-lifecycle
+%%| fig-cap: "Lifecycle of a Solr query from the SolrJ client through the search handler, query parser, Lucene IndexSearcher, and facet component back to JSON."
+sequenceDiagram
+    participant C as Client (SolrJ)
+    participant N as Solr Node (HTTP)
+    participant SH as Search Handler
+    participant QP as Query Parser
+    participant L as Lucene IndexSearcher
+    participant FC as Facet Component
+    C->>N: GET /solr/shows/select?q=...
+    N->>SH: dispatch
+    SH->>QP: parse(q, fq, defType)
+    QP-->>SH: Query tree (BooleanQuery, etc.)
+    SH->>L: search(query, topN, sort)
+    L-->>SH: TopDocs
+    SH->>FC: compute facets on doc set
+    FC-->>SH: facet counts
+    SH-->>N: NamedList
+    N-->>C: JSON
+```
+
+## 3.2 Query parsers: Standard, DisMax, eDisMax
+
+- **Standard (Lucene) parser** (`defType=lucene`, default): full Lucene syntax — fielded queries, boolean operators, ranges, fuzzy, etc. Powerful but surfaces parse errors to end users. Bad for raw user input.
+- **DisMax**: simpler, forgiving syntax. Designed for user-facing search across multiple fields.
+- **eDisMax** (extended DisMax): superset of DisMax. Default choice for any user-facing search bar (product, content, or otherwise).
+
+### Why eDisMax wins for production
+
+eDisMax adds: support for full Lucene syntax inside the `q` string (so power users can do `platforms:Netflix`), proper escaping of bad input, phrase boosts on bigrams/trigrams (`pf2`, `pf3`), boost queries, and multiplicative boost functions.
+
+Key eDisMax params:
+
+| Param | What it does |
+|---|---|
+| `qf` | Query fields with per-field boosts: `qf=title^3 description^1 cast^2` |
+| `pf` | Phrase boost: if the full query appears as a phrase in these fields, boost it |
+| `pf2`, `pf3` | Phrase boost on bigrams / trigrams |
+| `ps`, `ps2`, `ps3` | Phrase slop (positions allowed between phrase tokens) |
+| `mm` | Minimum should match: `mm=2<-1 5<80%` ("for queries up to 2 terms all must match; for 5+ terms at least 80%") |
+| `tie` | Tie-breaker between dismax (`0.0`) and sum (`1.0`); typically `0.1` |
+| `bq` | Additive boost query: `bq=status:ongoing^5` |
+| `boost` | Multiplicative boost function |
+
+: The eDisMax parameters that matter in production, covering per-field boosts, phrase boosts, slop, minimum-should-match, tie-breaking, and additive plus multiplicative boosting. {#tbl-03-edismax-params}
+
+A realistic shows-catalog query — "find a stranger-things-like show on Netflix, prefer newer and ongoing series":
+
+```text
+GET /solr/shows/select?
+  defType=edismax
+  &q=stranger things
+  &qf=title^3 cast^2 description^1 text_all^0.5
+  &pf=title^5
+  &pf2=title^3 description^1
+  &ps=2
+  &mm=2<-1 5<75%
+  &tie=0.1
+  &bq=status:ongoing^5
+  &boost=recip(ms(NOW,added_at),3.16e-11,1,1)
+  &fq=platforms:Netflix
+  &fq=release_year:[2015 TO 2026]
+  &fl=id,title,rating,platforms,score
+  &facet=true&facet.field=genres&facet.field=platforms
+  &rows=20
+```
+
+The `boost=recip(...)` clause multiplies the score by a value that decays with document age — newer shows bubble up. `3.16e-11` is "per millisecond" for a 1-year half-life. The `bq=status:ongoing^5` adds an additive nudge for shows that are still being made, since a search bar usually wants to surface fresh content.
+
+### SolrJ equivalent
+
+```java
+import org.apache.solr.client.solrj.SolrQuery;
+import org.apache.solr.client.solrj.response.QueryResponse;
+import org.apache.solr.common.SolrDocumentList;
+
+SolrQuery q = new SolrQuery();
+q.setRequestHandler("/select");
+q.setParam("defType", "edismax");
+q.setQuery("stranger things");
+q.setParam("qf",   "title^3 cast^2 description^1 text_all^0.5");
+q.setParam("pf",   "title^5");
+q.setParam("pf2",  "title^3 description^1");
+q.setParam("ps",   "2");
+q.setParam("mm",   "2<-1 5<75%");
+q.setParam("tie",  "0.1");
+q.setParam("bq",   "status:ongoing^5");
+q.setParam("boost","recip(ms(NOW,added_at),3.16e-11,1,1)");
+q.addFilterQuery("platforms:Netflix");
+q.addFilterQuery("release_year:[2015 TO 2026]");
+q.setFields("id", "title", "rating", "platforms", "score");
+q.setRows(20);
+
+QueryResponse resp = client.query("shows", q);
+SolrDocumentList docs = resp.getResults();
+```
+
+## 3.3 Faceting
+
+Solr exposes faceting in three ways:
+
+1. **Legacy field/range/query/pivot facets** via `facet.*` params. Simple, flat.
+2. **JSON Facet API** (recommended). Nested, composable, supports aggregations like `avg`, `percentile`, `unique`. Introduced in Solr 6.0, per Yonik Seeley's original announcement on yonik.com (April 17, 2015): *"Solr 5 has a completely re-written faceted search and analytics module with a structured JSON API."*
+3. **Pivot facets** for hierarchical multi-field facets (the JSON API supersedes most uses).
+
+### Legacy field facet
+
+```text
+&facet=true&facet.field=genres&facet.field=platforms&facet.mincount=1&facet.limit=20
+```
+
+### Range facet
+
+```text
+&facet=true
+&facet.range=release_year&facet.range.start=1990&facet.range.end=2026&facet.range.gap=5
+```
+
+### JSON Facets — the modern API
+
+```json
+{
+  "query": "stranger things",
+  "filter": ["status:ongoing"],
+  "limit": 20,
+  "facet": {
+    "platforms": {
+      "type": "terms",
+      "field": "platforms",
+      "limit": 10,
+      "facet": {
+        "avg_rating": "avg(rating)",
+        "ongoing_count": { "type": "query", "q": "status:ongoing" }
+      }
+    },
+    "year_buckets": {
+      "type": "range",
+      "field": "release_year",
+      "start": 1990, "end": 2026, "gap": 5
+    },
+    "genres": { "type": "terms", "field": "genres", "limit": 20 }
+  }
+}
+```
+
+SolrJ:
+
+```java
+import org.apache.solr.client.solrj.request.json.JsonQueryRequest;
+import org.apache.solr.client.solrj.request.json.TermsFacetMap;
+import org.apache.solr.client.solrj.request.json.RangeFacetMap;
+
+TermsFacetMap platformFacet = new TermsFacetMap("platforms").setLimit(10)
+    .withStatSubFacet("avg_rating", "avg(rating)");
+RangeFacetMap yearRange = new RangeFacetMap("release_year", 1990, 2026, 5);
+
+JsonQueryRequest req = new JsonQueryRequest()
+    .setQuery("stranger things")
+    .withFilter("status:ongoing")
+    .setLimit(20)
+    .withFacet("platforms", platformFacet)
+    .withFacet("year_buckets", yearRange);
+
+QueryResponse resp = req.process(client, "shows");
+```
+
+> **Production tip — facet on `docValues=true` string fields.** Faceting on a tokenized text field gives you stems instead of category names. Faceting on a non-`docValues` field allocates a giant uninverted field cache on heap.
+
+## 3.4 Matching tools
+
+| Need | Syntax |
+|---|---|
+| Exact match | `q=platforms:Netflix` (string field) |
+| Prefix | `q=title:strang*` |
+| Wildcard | `q=title:t?ings` |
+| Fuzzy (edit distance 2) | `q=title:thinngs~` |
+| Phrase | `q=title:"stranger things"` |
+| Phrase with slop | `q=title:"stranger things"~2` |
+| Range | `q=release_year:[2015 TO 2026}` (`}` = exclusive) |
+| Boolean | `q=stranger AND (things OR strange) NOT comedy` |
+
+: A cheat sheet of the eight common matching idioms — exact, prefix, wildcard, fuzzy, phrase, slop, range, boolean — with the literal query syntax for each. {#tbl-03-matching-cheatsheet}
+
+The execution costs of each of these are covered in detail in §1.4. The short version: wildcards and leading-wildcards are slow; fuzzy queries are slower. If you need spelling tolerance, prefer the Spell Checker (§3.7) or an n-gram field. If you need leading-wildcard, use `ReversedWildcardFilterFactory` at index time.
+
+## 3.5 Relevance scoring — BM25 in honest detail
+
+Solr 10 ships **BM25Similarity** as the default. BM25 became the default similarity in Solr 5.0.0 (SOLR-8270/SOLR-8271): *"SchemaSimilarityFactory has been modified to use BM25Similarity as the default for fieldTypes that do not explicitly declare a Similarity. The legacy behavior of using ClassicSimilarity as the default will occur if the luceneMatchVersion for the collection is less than 5.0."* TF-IDF (`ClassicSimilarity`) survives but is legacy.
+
+The Lucene Javadoc for `BM25SimilarityFactory` defines the parameters explicitly: *"k1 (float): Controls non-linear term frequency normalization (saturation). The default is 1.2 · b (float): Controls to what degree document length normalizes tf values. The default is 0.75."*
+
+### The BM25 formula
+
+In Chapter 1 we promised "BM25 in one paragraph, no math." Here is the actual formula — it's worth seeing once because every tuning decision and every weird scoring artifact you'll encounter traces back to it.
+
+For a document `D` and a query `Q` made of terms `t₁, t₂, ..., tₙ`:
+
+```
+                           tf(t,D) · (k1 + 1)
+score(D,Q) =  Σ  IDF(t) · ─────────────────────────────────────
+              t∈Q          tf(t,D) + k1 · (1 - b + b · |D|/avgdl)
+```
+
+What each piece means:
+
+- **`tf(t,D)`** — how many times term `t` appears in document `D`.
+- **`IDF(t)`** — inverse document frequency. Big for rare terms, small for common terms.
+- **`|D|`** — length of document `D` (token count) in the scored field.
+- **`avgdl`** — average document length across the corpus, per field.
+- **`k1`** — TF saturation knob, default `1.2`.
+- **`b`** — length-normalization knob, default `0.75`.
+
+The shape of the formula is the entire story:
+
+- The **numerator** is roughly proportional to `tf(t,D)` but capped: as `tf` grows large, the contribution approaches a horizontal asymptote. Repeated mentions of a term yield diminishing returns. That's **saturation**, controlled by `k1`.
+- The **denominator** contains `(1 - b + b · |D|/avgdl)`. When the document is the average length, this term is `1`. When the document is longer than average, the denominator grows and the score shrinks. That's **length normalization**, controlled by `b`. Set `b=0` to disable it entirely; set `b=1` for full normalization.
+- **`IDF(t)`** is a per-term multiplier in front. A term appearing in 1% of documents gets a much larger IDF than a term appearing in 50%. This is why rare terms dominate scoring.
+
+Intuition for the levers:
+
+- **`k1=1.2` (default).** Smaller `k1` means TF saturates faster — repeated mentions barely help. Larger `k1` rewards verbose matches. For short show titles where each token is rare and meaningful (`Stranger Things`, `Severance`), `k1=1.2` is fine; for long synopsis fields you might lower it to `0.9` so a synopsis that mentions "running" five times doesn't dominate.
+- **`b=0.75` (default).** Higher `b` punishes long docs more. A shows catalog has wildly uneven description lengths (a one-line tagline vs. a 500-word recap) so `b=0.75` is a good default; if you mix tweet-length and article-length content in the same field, tune `b` per field-type.
+
+Override per field type:
+
+```xml
+<fieldType name="text_en" class="solr.TextField">
+  <similarity class="solr.BM25SimilarityFactory">
+    <float name="k1">1.0</float>
+    <float name="b">0.6</float>
+  </similarity>
+  <analyzer>...</analyzer>
+</fieldType>
+```
+
+Always tune by measuring (NDCG@10, MRR, click-through). Don't tune by intuition. For a deep dive on BM25's derivation and tuning, the canonical reference is [Elastic's "The BM25 algorithm and its variables"](https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables) — the engine is the same Lucene one Solr uses.
+
+### Function queries for custom scoring
+
+Function queries compute a score from doc fields:
+
+```text
+q=stranger things&boost=product(popularity, recip(ms(NOW,added_at),3.16e-11,1,1))
+```
+
+This multiplies score by `popularity × (1 / (age_factor + 1))` — so a stale but popular show competes with a fresh-but-less-popular one. Useful for time-decay, popularity blending, regional preference. Common functions: `sum`, `product`, `div`, `recip`, `log`, `pow`, `if`, `geodist`, `ms`, `query`.
+
+## 3.6 Vector search and hybrid retrieval
+
+### The end-to-end picture: two parallel pipelines
+
+Before walking into the vector mechanics, it helps to see how lexical and vector retrieval sit *side by side* in the same Solr collection. At indexing time, every document feeds two completely separate index structures within the same segment:
+
+```{mermaid}
+%%| label: fig-03-lexical-vector-pipelines
+%%| fig-cap: "The two parallel indexing pipelines inside a single Solr segment: the analyzer builds an inverted index while the embedding model populates the HNSW vector graph."
+flowchart TB
+    DOC["DOCUMENT<br/>'Apache Solr powers fast scalable search'"]
+    DOC --> TXT["TEXT ANALYSIS<br/>(Lucene analyzer chain)"]
+    DOC --> EMB["EMBEDDING MODEL<br/>(external API call,<br/>e.g. OpenAI text-embedding-3-small)"]
+
+    TXT --> TOK["Tokens:<br/>apach, solr, power,<br/>fast, scalabl, search"]
+    EMB --> VEC["Vector: 384 or 1536 floats<br/>[0.12, -0.45, 0.78, ..., 0.33]"]
+
+    TOK --> INV["INVERTED INDEX<br/>(.tim / .doc / .pos)<br/><br/>apach  → [doc1, doc5]<br/>solr   → [doc1, doc3]<br/>search → [doc1, doc2]<br/>..."]
+    VEC --> HNSW["HNSW GRAPH<br/>(.vec / .vex / .vem)<br/><br/>Each node = 1 vector<br/>Edges = nearest neighbors<br/>Multi-layer graph"]
+
+    INV --> SEG["SOLR SEGMENT<br/>(one set of files on disk)"]
+    HNSW --> SEG
+```
+
+The same `SolrInputDocument` you indexed in §2.6 populated *both* sides: the tokenized `title` and `description` fields built the inverted index; the `embedding` field built the HNSW graph. At query time, two parallel paths read from those two structures and produce two ranked lists. Then a fusion step combines them.
+
+### `DenseVectorField` and the `knn` parser (Solr 9.0+)
+
+Configured via the field type in §2.3. To search:
+
+```text
+q={!knn f=embedding topK=20}[0.012, -0.183, ..., 0.044]
+```
+
+That syntax says: "find the top-20 nearest neighbors of the given query vector in the `embedding` field." Solr uses the Lucene HNSW (Hierarchical Navigable Small World) graph internally.
+
+### HNSW: how the graph walk actually works
+
+HNSW is a **layered proximity graph**. Every vector you index becomes a node. Edges connect each node to its approximate nearest neighbors (up to `M = hnswMaxConnections`, default 16). The trick: not every node lives on every layer. A small fraction of nodes are randomly promoted to higher layers, where they form a sparser graph with longer edges. The top layer has only a handful of nodes; the bottom layer (layer 0) has every node.
+
+```{mermaid}
+%%| label: fig-03-hnsw-graph-walk
+%%| fig-cap: "The HNSW layered greedy walk: enter at a sparse top layer, jump to the locally closest neighbor, descend layer by layer, and exhaust the dense bottom layer."
+flowchart TB
+    Q(("query<br/>vector"))
+    subgraph L3["Layer 3 — sparsest, long jumps"]
+        L3A(("entry<br/>point"))
+    end
+    subgraph L2["Layer 2"]
+        L2A(("○"))
+        L2B(("○"))
+    end
+    subgraph L1["Layer 1"]
+        L1A(("○"))
+        L1B(("○"))
+        L1C(("○"))
+    end
+    subgraph L0["Layer 0 — every vector, dense"]
+        L0A(("○"))
+        L0B(("○"))
+        L0C(("★ closest"))
+        L0D(("○"))
+        L0E(("○"))
+    end
+    Q -.->|"1- Enter at top"| L3A
+    L3A -->|"2- Greedy: jump to<br/>closest neighbor,<br/>descend"| L2A
+    L2A --> L2B
+    L2B -->|"3- Descend"| L1B
+    L1B --> L1C
+    L1C -->|"4- Descend to layer 0"| L0C
+    L0C -->|"5- Exhaust local<br/>neighborhood"| L0B
+    L0C --> L0D
+```
+
+The walk has two phases — a greedy descent through the upper layers, then a wider sweep at layer 0:
+
+1. **Enter** at a fixed entry point in the top layer.
+2. **Greedy step:** look at all neighbors of the current node. If any neighbor is closer to the query than the current node, move to the closest one. Repeat until no neighbor improves distance. This finds the local minimum on this layer.
+3. **Descend** to the next layer, using the local minimum as the entry point.
+4. **Repeat** until you reach layer 0.
+5. **At layer 0**, do an exhaustive search of a candidate pool of size `efSearch` (default = `topK`). Return the `topK` closest from that pool.
+
+Why this is fast: each layer halves the search space. The top layers do long jumps over the vector space, like the express lanes of a skip list; the bottom layer does fine-grained local refinement. Visiting ~20 nodes out of 15,000 vectors is typical, vs. 15,000 brute-force distance computations.
+
+Approximate, not exact — the algorithm trades a small amount of recall for orders of magnitude in speed.
+
+The main knobs you have on HNSW are graph density at build time, build-time search effort, and query-time search effort. Defaults work well for most workloads; the [Solr Dense Vector Search reference](https://solr.apache.org/guide/solr/latest/query-guide/dense-vector-search.html) covers all of them. For the algorithm itself, the original paper by Malkov & Yashunin ("[Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320)") is the canonical reference.
+
+### Cosine similarity, with an example
+
+The HNSW graph walk finds candidates close to the query, but "close" needs a distance metric. The most common for embedding vectors is **cosine similarity**: it measures the *angle* between two vectors, ignoring their magnitudes.
+
+Two vectors pointing in the same direction → cosine `1.0`. Perpendicular → `0.0`. Opposite → `-1.0`. In practice with real text embeddings you almost always see values in roughly `[0.0, 1.0]` — strongly negative similarities are rare because nothing in natural-language space points the *opposite* direction of anything else.
+
+A worked example with four documents. **The numbers below are illustrative, not measured** — they are the *shape* you should expect from a modern sentence-embedding model (e.g., `sentence-transformers/all-MiniLM-L6-v2`, OpenAI `text-embedding-3-small`). Exact values depend on the model, the corpus, and the prompt template; if you reproduce this exercise locally you will see different absolute numbers but the same *ordering*.
+
+Query: `"dark sci-fi thriller about memory and identity"`. Suppose we embed this query and the description of four shows from our seed catalog:
+
+| Document | Description (excerpt) | Cosine to query (illustrative) |
+|---|---|---|
+| `SVR-001` (Severance) | "Workers undergo a procedure that surgically divides their memories between their work and personal lives." | **~0.85–0.95** — semantic bullseye |
+| `BM-001` (Black Mirror) | "Anthology series exploring a twisted, high-tech multiverse where humanity's greatest innovations and darkest instincts collide." | **~0.70–0.80** — same concept space, different words |
+| `BRG-001` (Bridgerton) | "Wealth, lust, and betrayal set in the backdrop of Regency-era England." | **~0.05–0.15** — unrelated topic |
+| `MH-001` (Mindhunter) | "FBI agents interview imprisoned serial killers to understand their psychology." | **~0.30–0.45** — shares "dark" and "psychological" but not sci-fi |
+
+Three things worth noticing:
+
+1. **Direct keyword overlap helps** (`SVR-001` shares "memories"), but it's not required. `BM-001` has near-zero word overlap with the query yet scores well — that's the semantic similarity working as advertised.
+2. **Polysemy is partially handled** (`MH-001`). It is "dark" and "psychological" but not "sci-fi," and the embedding model knows that. The score drops below `BM-001` but stays above totally unrelated shows like `BRG-001`.
+3. **Magnitude doesn't matter.** A 6-word title and a 500-word synopsis that both genuinely talk about the same concept can score similarly — cosine ignores vector length. (Compare with BM25, which heavily penalizes long documents.)
+
+#### `similarityFunction` in `DenseVectorField`
+
+Solr exposes three similarity functions on the field type:
+
+```xml
+<fieldType name="knn_vector_384" class="solr.DenseVectorField"
+           vectorDimension="384"
+           similarityFunction="cosine"      <!-- options: dot_product, euclidean, cosine -->
+           knnAlgorithm="hnsw"/>
+```
+
+Which one to choose:
+
+- **`cosine`** — safe default. Works for any embedding model.
+- **`dot_product`** — faster than `cosine` *if* you can guarantee your vectors are pre-normalized to unit length. Most modern embedding models (OpenAI's `text-embedding-3-*`, Sentence-Transformers' `all-MiniLM-L6-v2`, Cohere's `embed-v3`) return unit vectors by default. When they do, `dot_product` and `cosine` produce identical rankings but `dot_product` skips the normalization step.
+- **`euclidean`** — only correct if your embedding model was trained with Euclidean distance. Most aren't. If in doubt, don't.
+
+> **Production tip.** Confirm your embedding model's output is normalized once (compute the L2 norm of a sample vector — it should be very close to `1.0`), then use `dot_product`. Free performance.
+
+For the underlying math, see the [Wikipedia article on cosine similarity](https://en.wikipedia.org/wiki/Cosine_similarity) or Pinecone's [introduction to cosine similarity](https://www.pinecone.io/learn/vector-similarity/).
+
+### What's new in Solr 10 for vectors
+
+The Solr 10.0 reference guide explicitly lists, as new features: *"Scalar and binary quantized dense vectors are now supported for DenseVectorField (SOLR-17780, SOLR-17812). Quantization reduces memory consumption and can improve search performance at some cost to accuracy."* And: *"GPU-accelerated approximate nearest neighbor search is now available via the cuVS-Lucene pluggable codec (SOLR-17892)."*
+
+A binary-quantized field (1 bit per dimension instead of 32):
+
+```xml
+<fieldType name="binary_quantized_vector" class="solr.BinaryQuantizedDenseVectorField"
+           vectorDimension="384"/>
+<field name="embedding_bq" type="binary_quantized_vector" indexed="true" stored="true"/>
+```
+
+This reduces memory footprint roughly 32× at a measured accuracy cost — appropriate for very large vector corpora.
+
+### Hybrid search: combining keyword + vector
+
+The two ranked lists you've now produced — BM25 results and KNN results — answer different questions and have **incomparable score scales**. A BM25 score of 12.5 means nothing in isolation; a cosine score of 0.92 is on `[-1, 1]`. You cannot just average them or take a weighted sum without first re-scaling, and re-scaling is fragile across queries.
+
+This is the entire reason **Reciprocal Rank Fusion** exists.
+
+Two production-grade approaches:
+
+1. **Rerank.** Use BM25 to retrieve a generous top-N candidate set; rerank the top-N with a vector query.
+2. **Reciprocal Rank Fusion (RRF).** Run BM25 and KNN as two retrievers; fuse their ranked lists by `1 / (k + rank)` and sort. **Score-agnostic** — only the rank position matters.
+
+**Rerank approach (works on Solr 10.0 today)**:
+
+```text
+q=stranger things
+&defType=edismax&qf=title^3 description^1
+&rq={!rerank reRankQuery=$rqq reRankDocs=200 reRankWeight=2}
+&rqq={!knn f=embedding topK=200}[...query vector...]
+```
+
+This says: "BM25 retrieves a large pool; rerank the top 200 by blending in a KNN-similarity score weighted 2×."
+
+### RRF in honest detail, with a worked example
+
+Two retrievers return ranked lists. For each document, sum `1/(k + rank_in_that_list)` across all retrievers; documents not in a given list contribute 0. Sort descending by the fused score. The constant `k = 60` is the canonical Cormack/Clarke/Büttcher (2009) value — small enough to give the top ranks real weight, large enough to keep noisy late ranks from dominating.
+
+```
+                        1
+  RRF(d) =   Σ    ─────────────
+            i∈R   k + rank_i(d)
+
+  where R = set of retrievers, k = 60
+        rank_i(d) = rank of doc d in retriever i (or ∞ if not present)
+```
+
+```{mermaid}
+%%| label: fig-03-rrf-fusion
+%%| fig-cap: "Reciprocal Rank Fusion combines a BM25 ranked list with a KNN vector ranked list by summing 1/(k+rank), making the score-scale mismatch irrelevant."
+flowchart LR
+    Q[User query] --> BM25[BM25 retriever]
+    Q --> EMB[Embed → KNN retriever]
+    BM25 --> RL1["ranked list 1<br/>doc5, doc1, doc7, doc3, doc2"]
+    EMB --> RL2["ranked list 2<br/>doc8, doc5, doc2, doc1, doc9"]
+    RL1 --> RRF{"RRF<br/>Σ 1/k+rank"}
+    RL2 --> RRF
+    RRF --> OUT["fused top-K"]
+```
+
+Suppose, for the query `"dark sci-fi thriller about memory and identity"` (continuing the example from §3.6's cosine table), the two retrievers return:
+
+- **BM25 ranks:** `MH-001` (#1, score 12.5), `BB-001` (#2, 11.2), `BM-001` (#3, 10.8), `WW-001` (#4, 9.5), `BRG-001` (#5, 8.3)
+- **KNN ranks:** `SVR-001` (#1, cos 0.92), `MH-001` (#2, 0.89), `BM-001` (#3, 0.85), `BB-001` (#4, 0.81), `WW-001` (#5, 0.78)
+
+The raw scores live on totally different scales — BM25 is unbounded positive, cosine is `[-1, 1]`. Trying to add them directly would be nonsense. RRF throws away the scores and uses only ranks:
+
+| Document | BM25 rank | KNN rank | RRF calculation | RRF score |
+|---|---|---|---|---|
+| `MH-001` | 1 | 2 | `1/(60+1) + 1/(60+2)` | **0.03253** |
+| `BB-001` | 2 | 4 | `1/(60+2) + 1/(60+4)` | **0.03175** |
+| `BM-001` | 3 | 3 | `1/(60+3) + 1/(60+3)` | **0.03175** |
+| `SVR-001` | — | 1 | `0 + 1/(60+1)` | **0.01639** |
+| `WW-001` | 4 | 5 | `1/(60+4) + 1/(60+5)` | **0.03101** |
+| `BRG-001` | 5 | — | `1/(60+5) + 0` | **0.01538** |
+
+Sorted final ranking:
+
+1. `MH-001` (Mindhunter) — strong in **both** lists. Wins decisively despite not being a sci-fi show, because both retrievers agree on its "dark psychological" character.
+2. `BB-001` (Breaking Bad) — good in both. Second. Same kind of cross-retriever agreement.
+3. `BM-001` (Black Mirror) — good in both, tied with `BB-001`.
+4. `WW-001` (Westworld) — present in both but ranked lower; still beats the vector-only hit.
+5. `SVR-001` (Severance) — vector-only hit. A pure semantic match the keyword retriever missed because the query didn't share many lexical tokens with the synopsis. **This is exactly what RRF protects against** in pure-BM25 systems: semantic matches that have no keyword overlap.
+
+**The key insight:** documents that appear in *both* lists at reasonable ranks systematically beat documents that appear in *only one* list at the top rank. Cross-retriever agreement is the strongest signal you have for relevance. This is why RRF works so well in practice despite being almost trivially simple.
+
+**Important version note.** Native Reciprocal Rank Fusion is tracked in Apache JIRA as **SOLR-17319**. The JIRA records: *"Fix Version/s: 10.1, 9.11"*. RRF is **not** in Solr 10.0.0 — you must wait for **Solr 10.1** (or Solr 9.11 on the 9.x line) for the native query-parser form. In the meantime, do RRF in your application layer (run a BM25 query and a KNN query in parallel, merge results client-side) or use the rerank pattern above.
+
+```java
+// Client-side RRF in SolrJ (works on Solr 10.0)
+record Ranked(String id, int rank) {}
+List<Ranked> bm25 = runBm25(...);
+List<Ranked> knn  = runKnn(...);
+int k = 60;
+Map<String, Double> fused = new HashMap<>();
+for (Ranked r : bm25) fused.merge(r.id(), 1.0 / (k + r.rank()), Double::sum);
+for (Ranked r : knn)  fused.merge(r.id(), 1.0 / (k + r.rank()), Double::sum);
+List<String> finalRanking = fused.entrySet().stream()
+    .sorted(Map.Entry.<String,Double>comparingByValue().reversed())
+    .map(Map.Entry::getKey).toList();
+```
+
+> **Production tip — tune `k` only if you've measured.** The canonical `k=60` is robust across a wide range of retrievers and corpora. Lower `k` (e.g., 10) makes top-rank agreement more dominant; higher `k` flattens the curve and lets mid-ranks contribute more. Most teams that tune `k` are reaching for the wrong knob — usually the actual fix is in retriever quality (better embeddings, better analyzer chain).
+
+## 3.7 Spell checking and suggestions
+
+`solrconfig.xml`:
+
+```xml
+<searchComponent name="spellcheck" class="solr.SpellCheckComponent">
+  <lst name="spellchecker">
+    <str name="name">default</str>
+    <str name="classname">solr.DirectSolrSpellChecker</str>
+    <str name="field">text_all</str>
+    <str name="distanceMeasure">internal</str>
+    <float name="accuracy">0.5</float>
+    <int name="maxEdits">2</int>
+  </lst>
+</searchComponent>
+
+<requestHandler name="/select" class="solr.SearchHandler">
+  <lst name="defaults"><str name="spellcheck.dictionary">default</str></lst>
+  <arr name="last-components"><str>spellcheck</str></arr>
+</requestHandler>
+```
+
+```java
+SolrQuery q = new SolrQuery("stragner thigns");      // user misspelled "stranger things"
+q.setParam("spellcheck", true);
+q.setParam("spellcheck.collate", true);
+QueryResponse resp = client.query("shows", q);
+resp.getSpellCheckResponse().getCollatedResults();    // returns "stranger things"
+```
+
+## 3.8 Highlighting
+
+```text
+&hl=true&hl.fl=title,description&hl.fragsize=160&hl.tag.pre=<mark>&hl.tag.post=</mark>
+```
+
+Returns matched snippets per doc with HTML markers around hit terms. Use the unified highlighter (`hl.method=unified`) for performance on long fields with positions+offsets indexed.
+
+## 3.9 Result grouping with the Collapse query parser
+
+Show one row per *franchise*, not one row per *show in the franchise*. Show one row per *creator*, not one row per *each of their shows*. The Collapse query parser plus the Expand component is how you do it in Solr 10 without leaving the JSON Facet world or paying the cost of the legacy `group=true` Result Grouping feature.
+
+The Solr 10 reference guide is explicit: *"Collapse & Expand can together do what the older Result Grouping (`group=true`) does for most use-cases but not all… Generally, you should prefer Collapse & Expand."*
+
+How it works:
+
+- `{!collapse field=franchise_id}` is a **post-filter** applied after BM25 scoring. For each value of `franchise_id`, only one representative document survives — by default the highest-scoring one. You can override with `min=release_year` (the original), `max=rating` (best-rated of the franchise), or `sort=...` for arbitrary tie-breaking.
+- The `expand` component then *re-fetches* the collapsed siblings for each surviving doc, so the UI can show "and 3 more shows in this franchise" without a second round-trip.
+
+For this example, assume the schema has been extended with a `franchise_id` field that groups related shows (e.g. all three Star Wars shows in our seed catalog — `TM-001`, `LK-001`, `AND-001` — share `franchise_id = "STAR-WARS"`; the *Better Call Saul* spinoff `BCS-001` shares `franchise_id = "BREAKING-BAD-UNIVERSE"` with `BB-001`):
+
+```text
+q=star wars
+&fq={!collapse field=franchise_id max=rating}
+&expand=true
+&expand.rows=4
+&fl=id,title,rating,franchise_id
+```
+
+From SolrJ:
+
+```java
+SolrQuery q = new SolrQuery(userQuery)
+    .setRequestHandler("/select")
+    .addFilterQuery("{!collapse field=franchise_id max=rating}")
+    .setFields("id,title,rating,franchise_id");
+q.set("expand", "true");
+q.set("expand.rows", "4");
+QueryResponse rsp = solr.query("shows", q);
+Map<String, SolrDocumentList> siblings = rsp.getExpandedResults();   // group_id → siblings
+```
+
+**Schema requirement.** The collapse field must be **single-valued** and either `docValues="true"` (recommended — used by default) or `indexed="true"` with `string`/numeric type. For SolrCloud, all members of a collapse group must live on the **same shard** — otherwise collapse happens per-shard and the merged result has duplicates. The standard way to guarantee co-location is the compositeId router's prefix-routing syntax, which uses your **uniqueKey** (the `<uniqueKey>` declared in the schema — by default the `id` field) to route documents:
+
+```text
+uniqueKey:        id
+schema:           <uniqueKey>id</uniqueKey>
+indexed id value: "STAR-WARS!TM-001"
+                   └─prefix──┘ └suffix─┘
+routing:          murmur3("STAR-WARS") % shardCount
+```
+
+The string before the `!` in the `id` is hashed; everything after the `!` is part of the unique identifier but ignored for routing. So `STAR-WARS!TM-001`, `STAR-WARS!LK-001`, and `STAR-WARS!AND-001` all land on the same shard. The collapse field (`franchise_id` in the example) is a **separate** field whose value matches the prefix (`"STAR-WARS"`) — you'd set both at index time.
+
+> **Note on this book's seed dataset.** The 30-show table in §2.3 uses simple IDs like `ST-001` without prefix routing, because the running examples assume a single-shard dev collection. If you adapt this schema for a multi-shard production deployment and want to collapse on franchise, switch the IDs to the `FRANCHISE!showcode` form at the start, never later.
+
+> **Production tip — routing matters.** This pattern only works if you commit to it at collection-create time and at index time. Switching routers later requires a full reindex into a new collection (§2.9.3). If you anticipate ever needing collapse, design the `id` prefix scheme on day 1.
+
+> **Production tip — single-shard collections sidestep the issue.** If your corpus fits in one shard (under ~50M docs), use a single-shard collection. Collapse works correctly with no routing gymnastics.
+
+## 3.10 Debugging queries: document transformers and `debug=true`
+
+When a customer reports "why is this result first?", the answer is one query parameter away.
+
+**`fl=...,[explain]`** annotates each returned document with its full BM25 (or LTR) scoring derivation:
+
+```text
+q=stranger things&fl=id,title,score,[explain style=nl]
+```
+
+Returns per-doc:
+
+```json
+{ "id": "ST-001", "score": 12.83,
+  "[explain]": {
+    "value": 12.83,
+    "description": "sum of:",
+    "details": [
+      {"value": 8.21, "description": "weight(title:stranger in 142) ..."},
+      {"value": 4.62, "description": "weight(title:thing in 142) ..."}
+    ]
+  } }
+```
+
+Other transformers that earn their keep:
+
+| Transformer | What it adds | When to use |
+|---|---|---|
+| `[explain]` or `[explain style=nl]` | Per-doc score derivation | Triaging "why is this ranked here" |
+| `[shard]` | The shard the doc came from | Triaging "why does this query miss in production but hit on a single-node dev cluster" |
+| `[docid]` | Internal Lucene doc-id | Catching segment-merge artifacts; almost never useful in app code |
+| `[features store=v1]` | LTR feature vector at request time | Logging features for offline model training (see Ch 6) |
+| `[child]` | Nested children for block-join queries | Validating nested-document indexing |
+| `[elevated]` / `[excluded]` | Boolean flag for QueryElevation hits | UI badges showing editorial overrides (see Ch 6) |
+
+: The document transformers worth knowing in production, what each one adds to the response, and when reaching for it actually saves you time. {#tbl-03-doc-transformers}
+
+The companion is `debug=true` (or finer: `debug=query`, `debug=timing`, `debug=results`), which adds a top-level `debug` block with the parsed query, per-component timing breakdown, and (with `results`) the explain text for every returned document. Same syntax across every Solr version since 4.x.
+
+> **Production tip.** `debug=timing` is the single most underused operations tool in Solr. It shows the per-`SearchComponent` time (query, facet, highlight, debug, stats, mlt) — if your p99 latency just doubled, this tells you in one request which component is responsible.
+
+## 3.11 Autocomplete and suggestions
+
+Solr offers two distinct mechanisms for autocomplete, and they answer different questions. Pick by asking **what the dropdown shows**:
+
+| The dropdown shows… | Use | Why |
+|---|---|---|
+| Query strings the user can click to *run* (`"stranger"`, `"stranger things"`, `"strange new worlds"`) | **SuggestComponent** | Ranked, weighted, low-latency phrase completion from a dictionary |
+| Actual shows the user can click to *open* (a specific title, a specific actor) | **EdgeNGram instant search** | A regular query over a field indexed with prefix n-grams |
+
+: How to choose between SuggestComponent and EdgeNGram instant search based on what the autocomplete dropdown actually shows the user. {#tbl-03-autocomplete-choice}
+
+For admin tooling that needs raw field values with a prefix lookup and no separate index — e.g., "list all genres starting with `sci`" — the older [`TermsComponent`](https://solr.apache.org/guide/solr/latest/query-guide/terms-component.html) is still the right answer. Don't use it for user-facing autocomplete: SuggestComponent is faster, ranks by weight, and supports infix matching.
+
+### 3.11.1 SuggestComponent — query completions
+
+**What it is.** A dedicated component (`solr.SuggestComponent`) that builds an in-memory or on-disk side structure (FST or Lucene infix index) from a dictionary field, and serves prefix/infix lookups against that structure at sub-millisecond latency.
+
+**Why you need it.** A plain `q=stranger*` wildcard query against your main index returns *documents*, not query strings, and ranks them by BM25 — which is wrong for autocomplete. SuggestComponent returns ranked **phrases** weighted by whatever you choose (popularity, recency, manually curated weight). It's the modern, recommended way to do query completions in Solr 10.
+
+The pattern is to build a small `_popular_queries` collection — one document per suggestable phrase, weighted by aggregated user clicks (Chapter 5) — and point the suggester at that.
+
+**Schema** (managed-schema):
+
+```xml
+<fieldType name="text_suggest" class="solr.TextField" positionIncrementGap="100">
+  <analyzer>
+    <tokenizer name="standard"/>
+    <filter name="lowercase"/>
+  </analyzer>
+</fieldType>
+
+<field name="suggest_phrase" type="text_suggest" indexed="true" stored="true"/>
+<field name="suggest_weight" type="plong" stored="true" docValues="true"/>
+```
+
+**Component + handler** (solrconfig.xml):
+
+```xml
+<searchComponent name="suggest" class="solr.SuggestComponent">
+  <lst name="suggester">
+    <str name="name">queries</str>
+    <str name="lookupImpl">AnalyzingInfixLookupFactory</str>
+    <str name="dictionaryImpl">DocumentDictionaryFactory</str>
+    <str name="field">suggest_phrase</str>
+    <str name="weightField">suggest_weight</str>
+    <str name="suggestAnalyzerFieldType">text_suggest</str>
+    <str name="indexPath">suggester_dir</str>
+    <str name="buildOnStartup">false</str>
+    <str name="buildOnCommit">false</str>
+  </lst>
+</searchComponent>
+
+<requestHandler name="/suggest" class="solr.SearchHandler" startup="lazy">
+  <lst name="defaults">
+    <str name="suggest">true</str>
+    <str name="suggest.dictionary">queries</str>
+    <str name="suggest.count">10</str>
+  </lst>
+  <arr name="components"><str>suggest</str></arr>
+</requestHandler>
+```
+
+**Example: build once, then query** (SolrJ):
+
+```java
+import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.client.solrj.request.QueryRequest;
+import org.apache.solr.client.solrj.response.QueryResponse;
+import org.apache.solr.client.solrj.response.Suggestion;
+import org.apache.solr.common.params.ModifiableSolrParams;
+
+try (var client = new CloudSolrClient.Builder(
+        List.of("http://solr-1:8983/solr", "http://solr-2:8983/solr"))
+        .withDefaultCollection("popular_queries").build()) {
+
+    // 1. Build the suggester. Run this from a scheduler, not on every commit.
+    ModifiableSolrParams build = new ModifiableSolrParams();
+    build.set("qt", "/suggest");
+    build.set("suggest.buildAll", "true");
+    build.set("distrib", "true");                  // fan out to every shard
+    var buildReq = new QueryRequest(build);
+    buildReq.setPath("/suggest");
+    client.request(buildReq);
+
+    // 2. Look up suggestions for what the user typed.
+    ModifiableSolrParams q = new ModifiableSolrParams();
+    q.set("qt", "/suggest");
+    q.set("suggest.q", "stra");           // matches "stranger things", "strange new worlds", ...
+    q.set("suggest.count", "10");
+    var qReq = new QueryRequest(q);
+    qReq.setPath("/suggest");
+    QueryResponse resp = qReq.process(client);
+
+    for (Suggestion s : resp.getSuggesterResponse()
+                            .getSuggestions().get("queries")) {
+        System.out.printf("%s  (weight=%d)%n", s.getTerm(), s.getWeight());
+    }
+}
+```
+
+> **Production tip — never `buildOnCommit=true`.** A rebuild on every soft commit will starve query traffic under any non-trivial write load. Build on a schedule (cron / Kubernetes `CronJob`) at whatever cadence matches your dictionary churn.
+
+> **Production tip — build every shard.** In SolrCloud the suggester data structure is per-replica. After a build, suggestions reflect only the replicas you built. Pass `distrib=true` (as above) or fan out explicitly.
+
+Further detail — alternative lookup implementations (`BlendedInfix`, `Fuzzy`, `FST`), `suggest.cfq` context filtering, expression-based weights — is in the [Solr Suggester reference](https://solr.apache.org/guide/solr/latest/query-guide/suggester.html).
+
+### 3.11.2 EdgeNGram — instant document matches
+
+**What it is.** A schema pattern where a field is indexed with `EdgeNGramFilterFactory`, breaking each token into prefix n-grams (`"stranger"` → `"st"`, `"str"`, `"stra"`, `"stran"`, `"strang"`, `"strange"`, `"stranger"`). Querying the indexed prefixes with the user's partial input becomes a regular term lookup — no wildcards, no separate component.
+
+**Why you need it.** When the dropdown should show real matching shows or actors (not query strings), you need a regular `/select` query that matches partial input. EdgeNGram is the standard way to make that fast: the typed input matches indexed prefixes directly, no `q=stra*` wildcard expansion.
+
+**Schema rule that surprises everyone:** apply `EdgeNGramFilterFactory` at **index time only**. Use a plain analyzer at query time. If you n-gram the query side too, `"stranger"` matches anything with `"st"`, recall explodes, and relevance collapses.
+
+```xml
+<fieldType name="text_instant" class="solr.TextField" positionIncrementGap="100">
+  <analyzer type="index">
+    <tokenizer name="standard"/>
+    <filter name="lowercase"/>
+    <filter name="edgeNGram" minGramSize="2" maxGramSize="15"/>
+  </analyzer>
+  <analyzer type="query">
+    <tokenizer name="standard"/>
+    <filter name="lowercase"/>
+  </analyzer>
+</fieldType>
+
+<field name="title"          type="text_general" indexed="true" stored="true"/>
+<field name="title_instant"  type="text_instant" indexed="true" stored="false"/>
+<field name="cast_instant"   type="text_instant" indexed="true" stored="false"/>
+<copyField source="title" dest="title_instant"/>
+<copyField source="cast"  dest="cast_instant"/>
+```
+
+**Example — instant search with phrase boost** (SolrJ):
+
+```java
+import org.apache.solr.client.solrj.request.SolrQuery;
+import org.apache.solr.client.solrj.response.QueryResponse;
+
+SolrQuery q = new SolrQuery(userInput)
+    .setRows(10)
+    .setFields("id", "title", "platforms", "rating");
+q.set("defType", "edismax");
+q.set("qf", "title_instant^1.0 cast_instant^0.7");
+q.set("pf", "title^4.0");          // phrase boost on the full (non-ngram) field
+q.set("ps", "2");
+q.set("timeAllowed", "150");       // typeahead must never block the UI
+
+QueryResponse resp = client.query("shows_instant", q);
+```
+
+> **Production tip — separate collection, tight timeout.** Run instant-search as its own collection (`shows_instant`) with the EdgeNGram analyzer. The index grows substantially with `(minGramSize, maxGramSize)`, so verify the size impact on a representative sample. Always set `timeAllowed=150` (ms) — a partial result beats a slow one when the user is mid-keystroke.
+
+The Solr reference covers `EdgeNGramFilterFactory` parameters in the [Tokenizers and Filters page](https://solr.apache.org/guide/solr/latest/indexing-guide/filters.html#edge-n-gram-filter).
+
+### 3.11.3 Combining them
+
+A mature autocomplete UX runs **both**: SuggestComponent on `/suggest` returns a few popular query phrases at the top of the dropdown, and an instant-search query against `shows_instant` returns three or four matching shows below (with poster thumbnails, etc.). The two requests fire in parallel from the client; whichever returns first renders first. The popular-queries dictionary feeding SuggestComponent is built from the signals pipeline in Chapter 5 — that's how suggestions stay aligned with what users actually search for.
+
+## Exercises
+
+1. **Build an eDisMax query in three steps.** Start with `q=stranger things`, `defType=edismax`, `qf=title^3 description^1 cast^2`. Run it against the seed catalog. Now add `pf=title^5` and `ps=2`. Run it again with `debug=true` and find the phrase-boost contribution in the parsed query. Finally, add `bq=status:ongoing^5` and `boost=recip(ms(NOW,added_at),3.16e-11,1,1)`. Look at the `[explain]` for the top result and identify which term contributed what fraction of the score.
+2. **Decide between Collapse and Result Grouping.** A streaming service extends its catalog with episode-level documents and wants the search results page to show one row per *show* (not per *episode*), with the highest-rated episode as the representative. Should they use `{!collapse field=show_id max=rating}` or legacy `group=true`? Justify using §3.9 and the routing requirements.
+3. **Hand-compute RRF.** Given BM25 ranks `[ST-001, BB-001, BM-001, MH-001, SVR-001]` and KNN ranks `[SVR-001, BM-001, ST-001, WED-001, BB-001]`, compute the RRF fused ranking with `k=60`. Which shows win? Which only-in-one-list show made the top 5? Now change `k=10` and recompute — does the ordering change?
+4. **Spot the slow query.** A user complains that `q=title:*ing` (searching for any title ending in "ing") is slow. Without running it, identify (a) which Lucene data structure is being scanned, (b) why this is more expensive than `q=title:stranger`, and (c) what schema change you would make to support this access pattern at scale.
+
+## 3.12 Chapter summary
+
+- Default to **eDisMax** for any user-facing search. Master `qf`, `pf`, `mm`, `tie`, `bq`, `boost`.
+- BM25 is the default similarity (since Solr 6); tune `k1` and `b` only with measured relevance metrics in hand.
+- The JSON Facet API (Solr 5+) is the modern way to compute facets and sub-aggregations.
+- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser, tune `efSearch`.
+- For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** (SOLR-17319, fix versions 10.1 and 9.11).
+
+---
