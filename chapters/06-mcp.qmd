@@ -1,0 +1,687 @@
+# Solr MCP — Exposing Solr to LLM agents
+
+> **What this chapter covers and why it matters.** A search engine is only as useful as the questions you can ask it. Chapters 2–3 taught you how to write Solr queries by hand; Chapter 5 taught you how to make the answers better. This chapter is about *removing the hand altogether*: standing up an MCP (Model Context Protocol) server in front of Solr so an LLM agent — Claude, GitHub Copilot, Cursor, JetBrains AI Assistant, any MCP client — can call Solr operations as tools using natural language. The shows collection you've built across the book becomes a thing your AI assistant can search, index into, and reason over.
+>
+> **Prerequisites:** Chapter 2 (you must understand what a collection, schema, and field type are), Chapter 3 (the parser and parameter surface the MCP server's `search` tool wraps), and Chapter 4 (the SolrCloud topology the MCP server connects to). Chapter 5 is helpful but not required — the MCP server doesn't yet expose LTR or signals tools, though §6.10 sketches what those would look like.
+>
+> **You will learn:** What [MCP](https://modelcontextprotocol.io) is and why Solr is a natural fit; the architecture of the [Apache Solr MCP Server](https://github.com/apache/solr-mcp) ([Spring AI MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html) + SolrJ); the four MCP primitives — `@McpTool`, `@McpResource`, `@McpPrompt`, `@McpComplete` — and what each one is for; the STDIO vs HTTP transport tradeoff; how to wire the server into Claude Desktop, Claude Code, VS Code, Cursor, and JetBrains IDEs; how to layer OAuth2 authentication and input-validation hardening on top of HTTP mode (and why STDIO needs none); how to get traces, logs, and metrics with the [LGTM observability stack](https://github.com/grafana/docker-otel-lgtm); how the server ships as both a JVM image (via [Jib](https://github.com/GoogleContainerTools/jib)) and a [GraalVM](https://www.graalvm.org/) native image; and how to think about designing your own MCP primitives for LLM consumption.
+>
+> **What you should not skip:** §6.5 (the shows-collection quick start — the smallest end-to-end loop), §6.3 (the four primitives — the entire user-visible API of any MCP server), and §6.10 (tool design — the difference between "an MCP server that exists" and "an MCP server an LLM uses well").
+
+## 6.1 What MCP is and why Solr fits it
+
+The **[Model Context Protocol](https://modelcontextprotocol.io)** (MCP) is an open standard from Anthropic, first published in November 2024 and adopted by Claude, OpenAI, Google, Microsoft, JetBrains, and others by mid-2025. It defines a simple JSON-RPC contract by which an LLM client (the *host*) can discover and invoke four kinds of *primitives* exposed by an external **server**:
+
+- **Tools** — callable functions with typed arguments and structured responses.
+- **Resources** — URI-addressable read-only data the client can fetch without invoking a tool.
+- **Prompts** — reusable, parameterised prompt templates that surface in clients as slash-commands.
+- **Completions** — typeahead suggestions for prompt arguments and resource-URI variables.
+
+Think of it as a USB-C port for AI: one protocol, many capabilities, no per-vendor adapter. The specification, reference clients, and the protocol [Inspector](https://github.com/modelcontextprotocol/inspector) all live at [modelcontextprotocol.io](https://modelcontextprotocol.io).
+
+For Solr specifically, the protocol is a near-perfect fit:
+
+- **Tools map cleanly to Solr operations.** "Search a collection," "list collections," "get the schema," "index a batch of documents," "create a collection" — every one is a verb-noun pair the protocol already knows how to express. The LLM doesn't need to know that the search verb under the hood becomes a `/select?q=...&fq=...&facet=true` URL; it sees a `search` tool with named parameters.
+- **Resources map cleanly to Solr metadata.** `solr://collections` returns the list of collections. `solr://shows/schema` returns the schema for the `shows` collection. The MCP client (and through it, the LLM) can read these *without invoking a tool* — a cheap, side-effect-free way to ground the model in the corpus.
+- **Solr's strengths line up with where LLMs are weak.** LLMs hallucinate facets; Solr returns real counts. LLMs guess at synonyms; Solr's analyzer chain knows them. LLMs invent IDs; Solr enforces a `uniqueKey`. Putting Solr behind an MCP tool lets the LLM stop guessing and start retrieving.
+
+The natural-language gain is concrete. Instead of writing:
+
+```text
+q=title:"stranger things" AND genres:sci-fi
+&fq=platforms:Netflix
+&fq=release_year:[2015 TO 2026]
+&facet=true&facet.field=genres
+&sort=rating desc
+&rows=10
+```
+
+a user can ask their assistant:
+
+> *"Find Netflix sci-fi shows with 'stranger things' in the title released since 2015, break down by genre, and sort by rating."*
+
+The LLM, using the Solr MCP Server, picks the right tool, fills in the parameters, runs the query, and presents the results — citing the actual documents. The user never sees the URL.
+
+## 6.2 The Apache Solr MCP Server: architecture
+
+The reference implementation we cover here is the **[Apache Solr MCP Server](https://github.com/apache/solr-mcp)**, an Apache 2.0 project that ships a small Spring Boot application exposing Solr operations as MCP tools, resources, prompts, and completions. The code is laid out by Solr concern — each subpackage owns its primitives:
+
+```text
+org.apache.solr.mcp.server
+├── Main.java                        // Spring Boot entry point, profile-driven
+├── collection/CollectionService     // list-collections, create-collection, completions
+├── indexing/IndexingService         // index-json / -csv / -xml, index-file-document
+├── schema/SchemaService             // get-schema, add-fields, add-field-types
+└── search/SearchService             // search
+```
+
+The component graph:
+
+```{mermaid}
+%%| label: fig-06-mcp-architecture
+%%| fig-cap: "Three-layer Solr MCP architecture: MCP clients talk to a Spring AI MCP server over STDIO or HTTP, which proxies through SolrJ to an existing Solr cluster."
+flowchart LR
+    subgraph Clients["MCP Clients"]
+      CD[Claude Desktop]
+      CC[Claude Code]
+      VS[VS Code / Copilot]
+      CR[Cursor]
+      JB[JetBrains AI]
+      IN[MCP Inspector]
+    end
+    subgraph Server["Solr MCP Server (Spring AI MCP)"]
+      direction TB
+      T1[search]
+      T2[index-json / csv / xml]
+      T3[list-collections]
+      T4[get-collection-stats]
+      T5[check-health]
+      T6[create-collection]
+      T7[get-schema]
+      R1[(solr://collections<br/>solr://collection/schema)]
+    end
+    subgraph Solr["Apache Solr (Ch 4)"]
+      direction TB
+      C1[(shows collection)]
+      C2[(shows_signals)]
+      C3[(other collections)]
+    end
+    OTEL[(LGTM stack<br/>traces · metrics · logs)]
+
+    Clients -->|STDIO or HTTP+MCP| Server
+    Server -->|SolrJ HTTP| Solr
+    Server -.->|OTLP, HTTP mode only| OTEL
+```
+
+Three layers, three responsibilities:
+
+1. **Clients** speak MCP over either STDIO (stdin/stdout JSON-RPC) or HTTP (Streamable HTTP / SSE). They discover the tool list at connect time, then call tools by name with typed arguments. The client is responsible for showing tool calls and results to the user.
+2. **Server** is a Spring Boot application built on [**Spring AI MCP**](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html) (the protocol implementation), with each primitive implemented as a method on a Spring `@Service` annotated `@McpTool` / `@McpResource` / `@McpPrompt` / `@McpComplete`. Spring AI handles JSON-RPC, transport, schema generation, and serialisation. The server uses **SolrJ** (the same client library from §2.6) to talk to Solr.
+3. **Solr** is your existing cluster — the one from Chapter 4. The MCP server is a separate process; it talks to Solr over HTTP just like any other application.
+
+The MCP server adds zero Solr-side state. It's a pure facade. You can run it as a sidecar to your Solr cluster, as a separate deployment in the same Kubernetes namespace, or — for local development — on your laptop talking to a [Docker](https://www.docker.com/) Compose Solr.
+
+## 6.3 The four MCP primitives
+
+Every MCP server is built from four primitives. The [Spring AI MCP server reference](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-annotations-server.html) maps one annotation to each one:
+
+| Primitive | Annotation | What the LLM sees | What the user sees |
+|---|---|---|---|
+| **Tool** | `@McpTool` | A callable function with typed args and a structured return. The LLM picks it based on the description. | The model invokes it; client surfaces the call + result inline. |
+| **Resource** | `@McpResource(uri = "…")` | A URI-addressable read-only blob. Read without a tool call, cheap, side-effect-free. | The client can `read` it or attach it as context. |
+| **Prompt** | `@McpPrompt(name = "…")` | A reusable, parameterised prompt template. | Surfaces as a slash-command or "prompt picker" in the client UI. |
+| **Completion** | `@McpComplete(prompt = … \| uri = …)` | Typeahead suggestions for a prompt arg or a resource-URI variable. | Powers the dropdown when the user types into a prompt arg or URI picker. |
+
+: The four MCP primitives — tool, resource, prompt, completion — with the Spring AI annotation, what the LLM sees, and what the human user sees in the client UI. {#tbl-06-mcp-primitives}
+
+Tools are the only primitive the LLM *invokes*. Resources and prompts can be invoked *or* surfaced for the user to choose. Completions are pure UX glue — they exist to make the other three pleasant to use from a typeahead picker. Pin this table; it's the conceptual surface of every MCP server you'll meet.
+
+### 6.3.1 Tools — `@McpTool`
+
+The Solr MCP Server exposes the operations a Solr admin or app developer would otherwise drive through `curl`, the Admin UI, or SolrJ. Pin this table; it's the entire tool surface:
+
+| Tool | What it does | Maps to (Solr) | Behavior hint |
+|---|---|---|---|
+| `list-collections` | Return all collection names in the cluster. | Collections API: `LIST` | read-only |
+| `get-collection-stats` | Index stats, query performance, cache hit ratios, handler throughput for one collection. | `/admin/metrics` filtered to the collection | read-only |
+| `check-health` | Status + doc count + responsiveness — one-call "is this healthy?" | `/admin/ping` plus a `numDocs` query | read-only |
+| `create-collection` | Create a new collection (`name`, `numShards`, `numReplicas`, `configset`). | Collections API: `CREATE` | destructive, **not** idempotent |
+| `get-schema` | Field defs, field types, dynamic fields, copy fields, unique key. | Schema API: `GET /schema` | read-only |
+| `add-fields` | Append `<field/>` definitions to a collection's schema. | Schema API: `POST add-field` | destructive, **not** idempotent |
+| `add-field-types` | Append `<fieldType/>` definitions. | Schema API: `POST add-field-type` | destructive, **not** idempotent |
+| `search` | Full search: `query`, `filterQueries`, `facetFields`, `sortClauses`, `start`, `rows`. | `/select` via SolrJ `SolrQuery` | read-only |
+| `index-json-documents` | Bulk-index a JSON array string. Batches of 1,000, per-doc retry on failure. | `/update/json/docs` via SolrJ `add(Collection)` | destructive, idempotent (if docs carry stable IDs) |
+| `index-csv-documents` | Bulk-index a CSV string (first row = headers). | `/update/csv` | destructive, idempotent (same caveat) |
+| `index-xml-documents` | Bulk-index a Solr-style `<add><doc>...</doc></add>` XML string. | `/update` | destructive, idempotent (same caveat) |
+| `index-file-document` | Bulk-index a file upload (JSON/CSV/XML) without the LLM having to ship the bytes inline. | Mode-dispatches to the three index tools above | destructive, idempotent (same caveat) |
+| `find-ref-guide-url` | Look up the canonical Apache Solr Reference Guide URL for a given concept or parameter. | Apache reference guide manifest (no Solr call) | read-only |
+
+: The thirteen tools exposed by the Apache Solr MCP Server, what each does, the Solr API it maps to, and the read-only / destructive / idempotent behavior hint attached at registration. {#tbl-06-tool-surface}
+
+The behavior-hint column is not folklore — those are real MCP **tool annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`) attached at registration time so clients can show distinct UI ("this will modify state, confirm?") and the host LLM can reason about safety. They were added in May 2026 to bring the server in line with the [MCP 2025-06-18 spec revision](https://modelcontextprotocol.io/specification).
+
+A minimal Solr-style tool implementation:
+
+```java
+@Service
+public class SearchService {
+
+    private final SolrClient solr;
+    public SearchService(SolrClient solr) { this.solr = solr; }
+
+    @McpTool(
+        name = "search",
+        description = "Search a Solr collection with query, filters, facets, sorting, and pagination.",
+        annotations = @McpToolAnnotations(readOnlyHint = true)
+    )
+    public SearchResponse search(
+        @McpToolParam(description = "Solr collection to query", required = true)
+            String collection,
+        @McpToolParam(description = "Solr query string (q parameter). Defaults to *:*")
+            Optional<String> query,
+        @McpToolParam(description = "Filter queries (fq parameter)")
+            List<String> filterQueries,
+        @McpToolParam(description = "Fields to facet on")
+            List<String> facetFields
+        // ... etc.
+    ) throws SolrServerException, IOException {
+        validateCollectionName(collection);              // §6.7.3
+        SolrQuery q = new SolrQuery(query.orElse("*:*"));
+        filterQueries.forEach(q::addFilterQuery);        // also validated, §6.7.3
+        facetFields.forEach(f -> { q.addFacetField(f); q.setFacet(true); });
+        QueryResponse rsp = solr.query(collection, q);
+        return SearchResponse.from(rsp);
+    }
+}
+```
+
+Spring AI generates the JSON-RPC schema from the parameter annotations, validates inputs against it, and serialises the response. You write Java; the framework handles MCP.
+
+#### The `search` tool, in detail
+
+This is the tool an LLM calls most. The parameter shape:
+
+```text
+search(
+  collection:    string,       // required — e.g., "shows"
+  query:         string,       // optional — Solr q parameter; default "*:*"
+  filterQueries: string[],     // optional — fq parameters (validated, §6.7.3)
+  facetFields:   string[],     // optional — facet.field (validated)
+  sortClauses:   [{item: string, order: "asc"|"desc"}],
+  start:         int,          // optional — pagination offset (bounded, §6.7.3)
+  rows:          int           // optional — result count; default 10 (bounded)
+) → {
+  numFound: int,
+  start:    int,
+  maxScore: float,
+  documents: [...],
+  facets:   { fieldName: { value: count, ... } }
+}
+```
+
+What it does *not* expose: `defType` (parser selection), `qf`/`pf`/`mm`/`bq`/`boost` (eDisMax tuning from §3.2), `rq` (LTR rerank from §5.4), `fl` (field list), and `debugQuery`. The choice is deliberate: the server's job is to be a stable, narrow surface that an LLM can reliably call. Letting the LLM drive eDisMax tuning per request is a footgun. If you need that flexibility, configure the parser defaults in `solrconfig.xml` and let them apply universally — the LLM never has to know.
+
+> **Production tip — narrow tools, broad config.** Resist the urge to expose every Solr knob as a tool parameter. Each parameter you expose is a chance for the LLM to set it incorrectly. Keep tool surfaces minimal and shape behavior via the collection's `solrconfig.xml` defaults. The model can still get great results — it just can't break things in novel ways.
+
+### 6.3.2 Resources — `@McpResource`
+
+A resource is a URI-addressable, read-only blob. Resources let an MCP client *ground* the LLM in cheap, side-effect-free context without spending a tool call.
+
+| Resource URI | Content | Annotation |
+|---|---|---|
+| `solr://collections` | JSON list of collection names. | `@McpResource(uri = "solr://collections")` |
+| `solr://{collection}/schema` | JSON schema dump for `{collection}`. | `@McpResource(uri = "solr://{collection}/schema")` |
+
+URI templates use [RFC 6570](https://datatracker.ietf.org/doc/html/rfc6570) syntax. Spring AI binds the path variables to method parameters by name:
+
+```java
+@McpResource(
+    uri = "solr://{collection}/schema",
+    description = "JSON schema dump for the named collection."
+)
+public SchemaResponse schemaFor(String collection) throws Exception {
+    return schemaService.getSchema(collection);
+}
+```
+
+The collection URI variable is what powers the `@McpComplete` typeahead in §6.3.4. The client never has to guess collection names; it asks the server.
+
+> **Tool vs Resource — when each wins.** Use a *tool* when the LLM needs to invoke an action with structured arguments and reason about the result (`search`, `index-json-documents`). Use a *resource* when the client can fetch the data ahead of time, attach it to the conversation, or surface it to the user in a side panel — without involving the model. Schema introspection is the canonical resource: cheap, side-effect-free, frequently needed as context.
+
+### 6.3.3 Prompts — `@McpPrompt`
+
+A prompt is a reusable, parameterised prompt template that surfaces in clients as a slash-command. The user types `/setup-collection` in Claude Desktop or MCP Inspector; the server returns a prompt that points the LLM at the right tools in the right order.
+
+The Solr MCP Server exposes six prompts, one per common workflow:
+
+| Prompt | Args | What it scripts |
+|---|---|---|
+| `explore-collections` | — | "List the collections; for each, fetch its schema and stats; summarise the cluster." |
+| `setup-collection` | `name`, `purpose` (optional) | "Create a collection with the configset and shard/replica defaults the server uses, then add the fields that match the `purpose`." |
+| `view-schema` | `collection` | "Read the `solr://{collection}/schema` resource and explain the field types, multi-valued fields, and unique key." |
+| `design-schema` | `collection`, `datasetDescription`, `sampleDocument` (optional) | "Given this dataset description, propose `add-fields` and `add-field-types` calls; explain the trade-offs." |
+| `index-data` | `collection`, `format` (json/csv/xml), `sample` (optional) | "Walk the user through `index-{format}-documents`, including batching, dry runs, and verification." |
+| `search-collection` | `collection`, `question` | "Translate the user's natural-language `question` into a `search` tool call; cite the documents returned." |
+
+: The six built-in MCP prompts, the arguments each one takes, and the multi-tool workflow each one directs the LLM to follow. {#tbl-06-prompts}
+
+Each prompt returns a `String` that the framework wraps as a single user-role `PromptMessage`. The templates *don't* do the work themselves — they instruct the LLM which tools to call, in what order, with which arguments. They are the seams that let a single user gesture (`/index-data shows json`) compose into a sequence of MCP tool calls.
+
+```java
+@McpPrompt(name = "setup-collection",
+           description = "Create a collection and walk through field setup for a given purpose.")
+public String setupCollection(
+    @McpArg(description = "Collection name") String name,
+    @McpArg(description = "What this collection is for") Optional<String> purpose
+) {
+    return """
+        Create a Solr collection named '%s' using the default configset '%s', \
+        %d shards, %d replicas. Then propose `add-fields` calls suitable for: %s. \
+        After each step, confirm before proceeding.
+        """.formatted(name, DEFAULT_CONFIGSET, DEFAULT_NUM_SHARDS,
+                      DEFAULT_REPLICATION_FACTOR, purpose.orElse("general use"));
+}
+```
+
+The body interpolates the live `DEFAULT_CONFIGSET` / `DEFAULT_NUM_SHARDS` / `DEFAULT_REPLICATION_FACTOR` constants so the prompt text cannot drift from the tool's defaults — a real bug class when prompt text duplicates tool config.
+
+> **Tool vs Prompt — when each wins.** A *tool* is what the LLM calls. A *prompt* is what the *user* invokes (typically as a slash-command) to *direct the LLM* to call the right tools. If you find yourself writing a tool whose body composes several other tools in a specific order, that's a prompt: lift the orchestration up so the user can trigger it directly and the LLM can pick the steps.
+
+### 6.3.4 Completions — `@McpComplete`
+
+A completion is a typeahead provider. It does not invoke anything; it suggests values for a prompt argument or a resource-URI variable as the user types. Clients with prompt pickers or resource pickers (MCP Inspector is the canonical one) hit `completion/complete` and render the suggestions in a dropdown.
+
+The Solr MCP Server has one completion today, bound to the `solr://{collection}/schema` resource template:
+
+```java
+@McpComplete(uri = "solr://{collection}/schema")
+public List<String> completeCollectionName(CompleteRequest.CompleteArgument arg)
+        throws SolrServerException, IOException {
+    if (!"collection".equals(arg.name())) return List.of();
+    String prefix = arg.value() == null ? "" : arg.value().toLowerCase(Locale.ROOT);
+    return listCollections().stream()
+        .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+        .sorted()
+        .limit(MAX_COMPLETION_RESULTS)        // 100 — MCP completion budget
+        .toList();
+}
+```
+
+A handful of design points worth pinning:
+
+- **Guard on the argument name.** The URI template has one variable (`collection`), but a future template might have more. Match on `arg.name()` so completion only fires for the variable you mean.
+- **Filter by prefix, sort stably, cap the response.** The MCP spec budgets a small list of completions per request; sending 10,000 collection names is both wasteful and unusable. 100, sorted, lowercase-prefix-filtered is the sweet spot.
+- **Re-use the underlying tool's data path.** The completion above calls the same `listCollections()` that the `list-collections` tool calls. One data path, two surfaces; no separate cache, nothing to invalidate.
+
+A completion can also be bound to a prompt argument: `@McpComplete(prompt = "search-collection")` powers the dropdown when the user types into the `collection` arg of the `/search-collection` slash-command. The handler signature is the same.
+
+> **Tool vs Completion — when each wins.** A *tool* is for the LLM. A *completion* is for the *client's typeahead UI*. They can be backed by the same underlying call; the distinction is who's consuming the result. If only your LLM ever needs the data, skip completion — `list-collections` already covers that. Add completion when a human user types into a picker.
+
+That's the entire user-visible API: 13 tools, 2 resources, 6 prompts, 1 completion. No LTR tool, no signals tool, no `relatedness()` tool — yet. §6.10 covers how you'd add them.
+
+## 6.4 Transport modes: STDIO vs HTTP
+
+The server supports both MCP transports. They are not interchangeable; pick by deployment shape:
+
+| | STDIO | HTTP |
+|---|---|---|
+| **How it works** | Server runs as a child process of the client; communicates via stdin/stdout JSON-RPC | Server runs as a long-lived web service on port 8080; clients connect over HTTP/SSE |
+| **Best for** | Local AI clients on a developer laptop (Claude Desktop, VS Code, JetBrains) | Multi-client, remote-team, or in-cluster deployments; [MCP Inspector](https://github.com/modelcontextprotocol/inspector) debugging |
+| **Authentication** | OS-level process isolation — the client launches the server, so the server inherits the user's identity | OAuth2 with JWT validation (Auth0, Keycloak, Okta, any OIDC provider) |
+| **Network exposure** | None — never listens on a port | Listens on 8080; behind a firewall and TLS in production |
+| **Observability** | Not supported (stdout is the protocol stream) | [OpenTelemetry](https://opentelemetry.io/) → LGTM stack (Grafana, Tempo, Loki, Mimir) |
+| **Lifecycle** | Lives as long as the client process | Long-lived; scale horizontally |
+| **Native-image variant** | Available — sub-second startup, no JVM | Available — same |
+
+: Side-by-side comparison of the STDIO and HTTP MCP transport modes across deployment shape, authentication, network exposure, observability, and lifecycle. {#tbl-06-transport-modes}
+
+**Use STDIO when** your Solr cluster is local or in the same private network and a single developer is the only consumer. The client owns the server's lifecycle, so there's no orphan process to manage.
+
+**Use HTTP when** you have multiple users sharing one Solr cluster (a team's internal search assistant), when you need OAuth2, when you need traces and metrics, or when you want to deploy the MCP server in Kubernetes alongside the SolrCloud cluster from §4.12.
+
+> **Why no observability on STDIO?** The MCP STDIO protocol uses stdout as the wire. Anything else printed to stdout — log lines, trace exporters, anything — corrupts the protocol stream. The server suppresses all stdout output in STDIO mode. This is also why Docker images for the server are built with [Jib](https://github.com/GoogleContainerTools/jib) instead of [Spring Boot Buildpacks](https://docs.spring.io/spring-boot/reference/packaging/container-images/cloud-native-buildpacks.html) (§6.9): buildpacks emit build banners to stdout that would break STDIO.
+
+> **Debugging tip — point [MCP Inspector](https://github.com/modelcontextprotocol/inspector) at HTTP mode.** Inspector is the protocol-level browser for MCP: it lists every tool, resource, prompt, and completion the server exposes, shows the JSON schemas, lets you call them with arbitrary inputs, and dumps the JSON-RPC traffic. Always exercise a new tool/prompt/completion in Inspector against HTTP mode before touching a real client — you'll see the schema and error responses without an LLM in the loop.
+
+## 6.5 Quick start with the `shows` collection
+
+End-to-end: from "Solr is running" to "Claude is searching `shows`" in about two minutes. Assumes a SolrCloud cluster from Chapter 4 reachable at `http://localhost:8983/solr/` with the `shows` collection populated using the seed data from §2.3.
+
+**Step 1 — Run the MCP server in STDIO mode** via Docker. The server runs as a child of the MCP client, so you don't actually invoke `docker run` directly; you configure the client to do so.
+
+**Step 2 — Configure Claude Desktop.** Edit `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS (or `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "solr-shows": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "SOLR_URL=http://host.docker.internal:8983/solr/",
+        "ghcr.io/apache/solr-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+The `-i` flag keeps stdin open for the JSON-RPC stream. `host.docker.internal` reaches the host machine from inside the container; Linux users add `--add-host=host.docker.internal:host-gateway` to the args.
+
+For a local development build (cloned `apache/solr-mcp`, ran `./gradlew build`), point at the JAR instead of the Docker image:
+
+```json
+{
+  "mcpServers": {
+    "solr-mcp": {
+      "command": "java",
+      "args": ["-jar", "/path/to/solr-mcp/build/libs/solr-mcp-1.0.0-SNAPSHOT.jar"],
+      "env": { "SOLR_URL": "http://localhost:8983/solr/" }
+    }
+  }
+}
+```
+
+The `java -jar` form is faster on cold start (no container layer) and lets you iterate on the server's Java code without rebuilding an image — the right shape for contributors and for plugging in a snapshot build.
+
+Restart Claude Desktop. The Solr tools appear in the tool drawer.
+
+### Verifying the server with MCP Inspector
+
+Before sending the first query through Claude, it's worth confirming the server is exposing the tools you expect. [`@modelcontextprotocol/inspector`](https://github.com/modelcontextprotocol/inspector) launches the same STDIO command Claude Desktop will and renders the protocol surface in a browser:
+
+```bash
+npx @modelcontextprotocol/inspector \
+    java -jar /path/to/solr-mcp/build/libs/solr-mcp-1.0.0-SNAPSHOT.jar
+```
+
+It opens on `localhost:6274` showing the connected server, the full tool list, and a form for each tool that lets you call it directly and see the raw JSON response — exactly the surface the LLM will see.
+
+![MCP Inspector v0.21.2 connected to the local `solr-mcp` server. Left: STDIO transport, the `java -jar` command that launches the server, and the connection state (`Connected`, server name `solr-mcp`, version 1.0.0). Middle: the tool list (`index-xml-documents`, `add-field-types`, `add-fields`, `get-schema`, …) and the recent-call history. Right: the form for the `search` tool, populated with `collection=shows`, plus the tool annotations (`Read-only ✓`, `Destructive ✗`, `Idempotent ✓`, `Open-world ✓`) that drive client-side safety prompts.](figures/06-mcp/01-inspector.png){#fig-06-mcp-inspector}
+
+The Inspector is the fastest way to debug a misbehaving tool or to validate annotation changes (e.g., flipping `Destructive` to `true` for a new write tool) before they reach an LLM.
+
+**Step 3 — Try it out.** In the Claude Desktop chat:
+
+> *"What collections are available in Solr?"*
+> → Claude calls `list-collections`, gets `["shows", "shows_signals", "shows_signals_aggr"]`, and lists them.
+
+> *"Show me the schema for the shows collection."*
+> → Claude reads the `solr://shows/schema` resource and summarises: `title` (text_en), `platforms` (string, multi-valued), `release_year` (pint), etc.
+
+> *"Search shows for Netflix sci-fi released after 2015. Sort by rating. Top 5."*
+> → Claude calls `search` with `collection="shows"`, `query="genres:sci-fi"`, `filterQueries=["platforms:Netflix", "release_year:[2015 TO *]"]`, `sortClauses=[{item:"rating", order:"desc"}]`, `rows=5`. Returns *Stranger Things*, *Black Mirror*, *Wednesday*, *Squid Game*, *The Witcher*.
+
+> *"Now break that down by genre."*
+> → Claude reissues the same query with `facetFields=["genres"]` and reads the bucket counts.
+
+> *"Add this show to the catalog: 3 Body Problem, Netflix, sci-fi, 2024, ongoing."*
+> → Claude composes a JSON document and calls `index-json-documents`. The new doc is queryable within seconds.
+
+A real session against the live `shows` collection looks like @fig-06-mcp-claude-desktop. Note how the LLM doesn't get it right on the first try — its initial filter `platform:"Amazon Prime"` returns zero results, so it issues a *facet* query against the `platform` field, discovers the actual value is `"Amazon Prime Video"`, and re-runs with the correct filter. The corrective loop is exactly what well-designed MCP tools enable: when a query returns nothing, the LLM has the tools (facets, schema reads) to figure out *why* and recover.
+
+![Claude Desktop turning a natural-language ask — *"give me comedies on amazon prime from my shows solr collection"* — into a chain of `search` tool calls. Claude first peeks at the schema, retries when its initial `platform:"Amazon Prime"` filter returns zero results, facets to discover the field value is actually `"Amazon Prime Video"`, then re-runs with `filterQueries=["platform:\"Amazon Prime Video\"", "genres:Comedy"]` and renders the five matches sorted by IMDb rating.](figures/06-mcp/02-claude-desktop.png){#fig-06-mcp-claude-desktop}
+
+The user never saw a Solr URL. The LLM never wrote `q=` or `fq=`.
+
+## 6.6 Client integration: Claude Desktop, Claude Code, VS Code, Cursor, JetBrains
+
+The MCP protocol is the same across clients; the configuration format isn't. Each client has its own config file or settings UI. The patterns repeat — `command + args` for STDIO, `type: "http" + url` for HTTP — so the table below is a quick reference and the per-client subsections below give the exact JSON.
+
+| Client | STDIO config file | HTTP config |
+|---|---|---|
+| Claude Desktop | `claude_desktop_config.json` | Same file, via `mcp-remote` wrapper |
+| Claude Code | `.mcp.json` (project) or CLI `claude mcp add` | Same |
+| VS Code (Copilot) | `.vscode/mcp.json` (workspace) or `settings.json` (user) | `"type": "sse"` URL |
+| Cursor | `.cursor/mcp.json` (project) or Settings UI | URL-only config |
+| JetBrains IDEs | `.junie/mcp.json` (project) or Settings → AI Assistant → MCP Servers | SSE transport |
+
+: Where each major MCP client (Claude Desktop, Claude Code, VS Code, Cursor, JetBrains) expects its STDIO config file and how it expresses an HTTP connection. {#tbl-06-client-config}
+
+### Claude Code (`.mcp.json`)
+
+The most common shape; put this at the root of your project:
+
+```json
+{
+  "mcpServers": {
+    "solr-shows": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm",
+               "-e", "SOLR_URL=http://host.docker.internal:8983/solr/",
+               "ghcr.io/apache/solr-mcp:latest"]
+    }
+  }
+}
+```
+
+For HTTP mode, swap the contents:
+
+```json
+{
+  "mcpServers": {
+    "solr-shows": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+### VS Code (`.vscode/mcp.json`)
+
+```json
+{
+  "servers": {
+    "solr-shows": {
+      "type": "sse",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+### Cursor and JetBrains
+
+Cursor accepts a top-level `mcpServers` block in `.cursor/mcp.json`; JetBrains accepts the same block in `.junie/mcp.json` once the AI Assistant plugin is installed. Both clients handle OAuth2 automatically when present.
+
+> **Production tip — separate STDIO and HTTP server instances per team.** If your developers each connect via STDIO on their laptops *and* you also expose an HTTP MCP server for your CI bots and dashboards, run them as two separate deployments. They have different security postures (process isolation vs. OAuth2) and different observability surfaces (none vs. full LGTM). Don't dual-purpose one binary.
+
+## 6.7 Security
+
+MCP has two transports with two completely different threat models. Treat them as different products that happen to share a codebase.
+
+### 6.7.1 STDIO: zero-auth by design, and that's correct
+
+In STDIO mode the server is a child process of the MCP client. The client launches it, pipes JSON-RPC over stdin/stdout, and reaps it on exit. There is no socket, no listener, no port. Three properties fall out of that:
+
+- **No network attacker can reach the server.** It is not on the network. The only way to send it bytes is to be the parent process — which means being the user who launched the client.
+- **The server runs as the user.** The OS process model is the auth: the server inherits the user's UID/GID, file permissions, environment, and the kernel's process isolation. The user can already do anything the server can do; authenticating "the user" to "their own subprocess" would be theatre.
+- **No CORS, no CSRF, no rate limit needed.** Those defend HTTP endpoints. STDIO has none.
+
+That's why the chapter shows STDIO config like `docker run -i --rm …` with no token, no API key, no header. The MCP client (Claude Desktop, Claude Code, VS Code, Cursor, JetBrains) is the trust boundary. If a malicious extension can spawn a Docker container as the user, you've already lost — not because of MCP, but because untrusted code is running locally.
+
+The one STDIO-specific failure mode worth knowing: **anything the server prints to stdout corrupts the protocol stream**. Logs, banners, accidental `System.out.println` calls — they all become unparseable JSON-RPC and the client disconnects. The server suppresses stdout in STDIO mode by routing all logging to stderr, and Docker images are built with [Jib](https://github.com/GoogleContainerTools/jib) (§6.9) rather than [Buildpacks](https://docs.spring.io/spring-boot/reference/packaging/container-images/cloud-native-buildpacks.html) precisely because Buildpacks emit banners to stdout on first container start. STDIO doesn't need auth, but it does need stdout hygiene.
+
+### 6.7.2 HTTP: OAuth2 with JWT validation
+
+In HTTP mode the server becomes a network-exposed service: a listener on port 8080, addressable from any client that can reach it. That changes everything. The server now needs authentication, input validation, transport encryption, and CORS — i.e., all the things a regular web service needs, applied through the lens of the MCP protocol.
+
+The Solr MCP Server uses **OAuth2 with JWT validation**, layered on by [Spring Security](https://docs.spring.io/spring-security/reference/) and the Spring AI Community MCP Security module. Any OIDC-compliant provider works: [Auth0](https://auth0.com/), [Keycloak](https://www.keycloak.org/), [Okta](https://www.okta.com/), AWS Cognito, Google Identity Platform.
+
+Enable it with three environment variables:
+
+```bash
+PROFILES=http
+SECURITY_ENABLED=true
+OAUTH2_ISSUER_URI=https://your-provider.example.com/
+```
+
+The server then:
+
+1. Exposes its OAuth2 metadata at `/.well-known/oauth-authorization-server` (per [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414)).
+2. Rejects unauthenticated requests with `401 Unauthorized` and a `WWW-Authenticate` header pointing to the metadata endpoint.
+3. Validates incoming JWTs against the issuer's JWK set on every request — signature, `iss`, `aud`, `exp`, `nbf`. The JWK set is fetched once and cached.
+
+Modern MCP clients (Claude Desktop via `mcp-remote`, Claude Code, VS Code, Cursor, JetBrains, MCP Inspector) all handle the OAuth2 flow transparently: when they hit the 401, they discover the authorization server, open a browser for user consent, exchange the authorization code for a token, and attach the token as `Authorization: Bearer ...` on every subsequent MCP request.
+
+The flow, end to end:
+
+```{mermaid}
+%%| label: fig-06-mcp-oauth2-flow
+%%| fig-cap: "The OAuth2 discovery and JWT-validation flow an MCP client follows to authenticate against the HTTP-mode Solr MCP server through any OIDC provider."
+sequenceDiagram
+    participant Client as MCP Client
+    participant Server as Solr MCP Server
+    participant IdP as OAuth2 Provider
+    Client->>Server: connect to /mcp
+    Server-->>Client: 401 + OAuth2 metadata URL
+    Client->>IdP: discover /.well-known/oauth-authorization-server
+    IdP-->>Client: authorization endpoint, token endpoint
+    Client->>IdP: open browser for login + consent
+    IdP-->>Client: authorization code (via local callback)
+    Client->>IdP: exchange code for token
+    IdP-->>Client: access token (JWT)
+    Client->>Server: MCP request + Bearer JWT
+    Server->>IdP: validate JWT signature against JWK set (cached)
+    Server-->>Client: MCP response
+```
+
+> **Production tip — pin callback URLs in your IdP.** Each MCP client uses a different callback URL on `http://localhost:<port>/oauth/callback`. MCP Inspector uses port 6274; the `mcp-remote` bridge used by Claude Desktop uses 3334; the server's own direct flow uses 8080. Register all three patterns in your OAuth2 application's allowed callback list, or only the client you configured first will work.
+
+> **Production tip — even though it's local, TLS in production.** The `--allow-http` flag for `mcp-remote` exists for development. In production, the MCP server sits behind TLS just like any other HTTP service, and the callback URLs are `https://...`. The flag is forgiving but the security model isn't.
+
+### 6.7.3 Input validation: defending the tool surface
+
+Authentication confirms *who* is calling. It does not confirm *what they're allowed to send*. An authenticated user — or an LLM acting on their behalf — can still craft a `search` tool call whose `query` parameter contains a Solr local-param that escalates privilege, or whose `filterQueries` reach into `_query_` or `_val_` blocks. Both transports need this layer; HTTP mode needs it more because the caller might not be running on the same machine as the data.
+
+The server enforces input validation at each tool boundary. Four representative classes:
+
+- **Local-param injection in `q`/`fq`.** Solr's `q={!parser ...}value` syntax lets the *first* characters of a query select an arbitrary parser. A `query` of `{!terms f=ssn}123,456,...` would dump SSN values regardless of what the tool's name says it does. The server rejects any `q`/`fq` that begins with `{!` unless the parser is on a small allowlist (typically `lucene`, `edismax`, `dismax`).
+- **Field-name allowlisting for `sortClauses` and `facetFields`.** Sorting on an arbitrary field can hit `docValues=false` fields and OOME the server. Faceting on the wrong field type can do the same. The server validates each name against the live schema and rejects unknowns with a clear MCP error rather than passing through to Solr.
+- **Pagination bounds.** `start ≥ 0`, `rows ≤ 1000`, `start + rows ≤ 50000`. Deep pagination is a known Solr footgun (§3.10) and an LLM that asks for `rows=1_000_000` should get a polite refusal, not a multi-gigabyte response.
+- **Collection-name format.** Every tool that names a collection validates it against Solr's actual naming rules (alphanumeric + `_`, max length, no path traversal) before issuing any Solr call. Centralising this check means a path-traversal attempt in `get-schema` fails the same way as one in `index-csv-documents`.
+
+These checks raise typed exceptions that Spring AI MCP translates into structured JSON-RPC errors. The client sees `code: -32602, message: "invalid sort field 'private_field'"` instead of a stack trace, and the LLM can recover gracefully.
+
+### 6.7.4 CORS, on HTTP mode
+
+The HTTP transport supports browser-based MCP clients (early versions of Inspector, future web hosts). That means CORS matters. Defaults out of the box:
+
+- `Access-Control-Allow-Origin`: `http://localhost:*` only. The localhost wildcard covers Inspector on 6274, `mcp-remote` on 3334, and dev hosts on any port.
+- Configurable via `MCP_CORS_ALLOWED_ORIGINS` env var as a comma-separated list when you need to grant a specific deployed host.
+
+Defaulting to `*` (or omitting CORS entirely) on a service that holds an OAuth2 access token would let any web page in any tab silently call your MCP server with the user's token. The default of localhost-only is deliberate and conservative.
+
+> **Production tip — defence in depth, not authentication-or-validation.** OAuth2 + JWT confirms *who*. Input validation + CORS confirms *what*. You need both. A signed JWT does not make a malicious query safe; a validated query does not make an unauthenticated caller safe. The server applies both gates to every HTTP request.
+
+## 6.8 Observability with the LGTM stack
+
+In HTTP mode, the server emits OpenTelemetry data — traces, metrics, logs — to any OTLP collector. The reference setup uses the **Grafana LGTM stack**: **L**oki for logs, **G**rafana for the UI, **T**empo for traces, **M**imir for metrics. Everything bundled in one `grafana/otel-lgtm` Docker container, perfect for local development; in production you'd point the same OTLP exporters at your existing observability backend.
+
+What gets traced automatically:
+
+- Every MCP tool invocation — one root span per call, with attributes for the tool name and arguments.
+- Every outgoing SolrJ HTTP call — one child span per Solr request.
+- Every incoming HTTP request to the server itself.
+- (In HTTP mode) the OAuth2 token validation cycle.
+
+What this lets you debug:
+
+- **"Why is the LLM's search slow?"** — Open the trace, see the SolrJ child span, find which Solr collection was slow, correlate with Solr's own metrics from §4.13.
+- **"Did the LLM call the tool I think it called?"** — Filter traces by tool name; the arguments are span attributes.
+- **"Are we paying for too many tool calls?"** — Mimir metrics give you tool invocation rate per minute.
+
+Standard config:
+
+```bash
+OTEL_TRACES_URL=http://localhost:4317                # OTLP gRPC endpoint
+OTEL_SAMPLING_PROBABILITY=1.0                        # 100% sampling in dev
+```
+
+In production, drop sampling to `0.05`–`0.1` (5–10%) and point at your real OTLP collector. The server uses `@Observed` annotations (Micrometer) on every service method, plus Spring Boot's auto-instrumentation for HTTP and SolrJ — you don't have to add tracing code yourself.
+
+## 6.9 Implementation: Spring AI MCP, Gradle, Jib, GraalVM, Testcontainers
+
+For the Java engineer reading this book, the *how it's built* matters as much as the *how it's used*. Five implementation choices anchor the project; each one is worth understanding because each one would have been wrong if chosen carelessly.
+
+### 6.9.1 [Spring AI MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html) for the protocol
+
+Spring AI MCP (Spring AI 1.1+) is the protocol implementation. Each primitive is a Spring-bean method annotated with one of the four `@Mcp…` annotations from §6.3:
+
+- `@McpTool` + `@McpToolParam` for tools (schema generated from method signature).
+- `@McpResource(uri = "…")` for resources (URI templates, path-variable binding).
+- `@McpPrompt(name = "…")` + `@McpArg` for prompts.
+- `@McpComplete(prompt = "…" \| uri = "…")` for completions.
+
+Spring AI handles the JSON-RPC envelope, generates the JSON schemas from parameter annotations, validates incoming arguments against them, serialises responses, and bridges to the chosen transport (STDIO over stdin/stdout, HTTP via Servlet or WebFlux). You write Java; the framework handles MCP. The same source tree compiles to both transports; the runtime profile picks which one starts up. The [Spring AI MCP server reference](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-annotations-server.html) is the authoritative API doc.
+
+### 6.9.2 [Gradle](https://gradle.org/) with the Kotlin DSL
+
+The project's build is a single `build.gradle.kts`. Three things make it tractable:
+
+- **Version catalog** (`gradle/libs.versions.toml`). Single source of truth for Spring Boot, Spring AI, SolrJ, Jib, GraalVM, Testcontainers versions. Renovate / Dependabot PRs touch exactly one file.
+- **Profile property `-Pnative`** flips between JVM and native builds. Without it, the build produces a JVM jar and Jib publishes a JVM image. With it, the GraalVM Native Build Tools plugin is applied and Buildpacks switches to the Paketo native-image buildpack. One property, both worlds.
+- **Profile property `-Pprofile=stdio|http`** picks which transport the native image bakes in. The native image's reflection metadata is profile-specific, so the build emits two binaries.
+
+### 6.9.3 [Jib](https://github.com/GoogleContainerTools/jib) for clean JVM images
+
+[Jib](https://github.com/GoogleContainerTools/jib) builds the JVM Docker images. The choice is *not* incidental: the standard [Spring Boot Buildpacks](https://docs.spring.io/spring-boot/reference/packaging/container-images/cloud-native-buildpacks.html) (Paketo) emit build banners to stdout during image creation, and those banners survive into the first container start. For a process whose stdout *is* the wire protocol (STDIO mode), one such banner breaks the JSON-RPC handshake the first time the client launches it. Jib produces silent, reproducible, layer-cached images with no first-run pollution, plus multi-arch (amd64 + arm64) as a side effect. Buildpacks are still used for the *native* image (§6.9.4) because the Paketo native-image buildpack is the supported path and native binaries don't have the same first-run-stdout problem.
+
+### 6.9.4 [GraalVM](https://www.graalvm.org/) native image for sub-second startup
+
+The server compiles to a [GraalVM](https://www.graalvm.org/) [native image](https://www.graalvm.org/latest/reference-manual/native-image/) via the [GraalVM Native Build Tools](https://graalvm.github.io/native-build-tools/latest/) Gradle plugin. The motivation is concrete: in STDIO mode the server is launched per session by the MCP client, so JVM startup *is* user-perceived latency. A native binary cuts cold start from ~2.5 s to under 200 ms.
+
+Two binaries are produced — one per transport:
+
+```bash
+./gradlew nativeCompile -Pnative -Pprofile=stdio
+./gradlew nativeCompile -Pnative -Pprofile=http
+```
+
+For container images, the same `bootBuildImage` task that produces JVM images via Jib produces native images via the Paketo native-image buildpack (selected automatically when `-Pnative` is set):
+
+```bash
+./gradlew bootBuildImage -Pnative -Pprofile=stdio
+./gradlew bootBuildImage -Pnative -Pprofile=http
+```
+
+Two practical wrinkles to know:
+
+- **Reflection metadata.** Spring AI's JSON-RPC layer reflects on `@McpTool`/`@McpResource` methods at startup. The project ships `META-INF/native-image/reachability-metadata.json` so the native image actually finds them. Without it, the server starts but exposes zero tools.
+- **The `dockerIntegrationTest` task runs the native image under Testcontainers.** This is how the project catches reflection-metadata regressions: if a new tool is added without its types being declared, the test fails when MCP Inspector can't list it.
+
+### 6.9.5 [Testcontainers](https://testcontainers.com/) for real-Solr integration tests
+
+[Testcontainers](https://testcontainers.com/) runs the integration tests against a real Solr (§2.7), with the version pinned via system property so the server is validated against Solr 9.x and 10.x in the same test suite:
+
+```bash
+./gradlew test -Dsolr.test.image=apache/solr:10.0.0
+./gradlew dockerIntegrationTest                            # JVM image vs Solr
+./gradlew dockerIntegrationTest -Pnative -Pprofile=stdio   # native STDIO image vs Solr
+./gradlew dockerIntegrationTest -Pnative -Pprofile=http    # native HTTP image vs Solr
+```
+
+That tested-version matrix is the only credible way to know whether the MCP server actually works against the Solr you run in production — and the only way to catch native-image breakage before it ships, since reflection regressions only surface at runtime.
+
+## 6.10 Designing primitives for an LLM to use well
+
+The Solr MCP Server's 13 tools, 6 prompts, 2 resources, and 1 completion are a starting set, not a ceiling. If you're building your own primitives (which you should: this is the gap chapter for the MCP book in the series), the design rules vary by primitive type. The first three rules below apply to *tools* — they're the highest-stakes surface because the LLM picks them autonomously. The fourth and fifth cover prompts and completions.
+
+**1. One verb per tool, predictable shape.** `search` is one verb. `search-and-then-summarise` is two and an LLM will get the second one wrong. Decompose. Let the host LLM compose by calling several tools in sequence — or, better, capture that composition as a *prompt* (rule 4) so the user can trigger it directly.
+
+**2. Constrain the input space.** Every free-text parameter is a chance for the model to hallucinate an invalid value. Where possible, enumerate. Instead of `query_parser: string`, take `query_parser: "edismax" | "lucene" | "dismax"`. Instead of `field: string`, expose a resource the client can preload, or a completion the client's typeahead can use (rule 5). The tool descriptions and parameter descriptions are part of the prompt to the LLM — write them as if you were writing to a thoughtful junior engineer who has never used Solr. And declare behaviour hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`) so the client can show appropriate confirmation UI.
+
+**3. Return structured data the LLM can quote, not narrative.** A `search` tool that returns `{numFound, documents:[...], facets:{...}}` lets the LLM cite document IDs verbatim. A tool that returns `"I found 42 sci-fi shows, the most popular is..."` forces the LLM to paraphrase your paraphrase. The structured response is shorter, more accurate, and cheaper in tokens.
+
+**4. Lift orchestration into prompts, not into a "mega-tool".** When you find yourself wanting a tool whose body composes three other tools in a specific order — say, "list collections, pick one, fetch its schema, propose fields" — that's a *prompt*, not a tool. A prompt has the LLM compose the steps and the *user* trigger the workflow. A tool has the LLM hide the steps from the user and pick them silently. The prompt is always the better default: the user sees what's happening and can intervene.
+
+**5. Add completions only when a human user types.** Completions are for typeahead UIs, not for LLMs. If only the LLM consumes a value space, `list-…` tools cover it (the model can fetch once and remember). Add a completion when there is a *prompt argument* or a *resource-URI variable* a human user will actually type into — and remember to guard on the argument name, sort the response, and cap it at ~100 entries.
+
+What you'd build next, on top of the primitives the server already exposes:
+
+- `recommend-similar-shows(id, k)` — uses §3.6 vector search under the hood. The LLM doesn't need to know about embeddings; it asks for "more like *Severance*" and gets `["BM-001", "MH-001", "WW-001"]`.
+- `find-related-genres(seed_query)` — wraps the §5.5 `relatedness()` aggregation. "What genres co-occur with `creator:'The Duffer Brothers'`?" returns a ranked list.
+- `personalised-search(user_id, query)` — runs the §5.4 LTR rerank with a per-user feature vector. Same `search` surface, but with personalisation baked in.
+- `pin-result(query, doc_id)` — wraps §5.6 query elevation. Useful when an editor uses the AI assistant to curate the search experience.
+
+Each of these is one more `@McpTool`-annotated method on a Spring `@Service`. The hard work — the schema, the analyser chain, the relevance loop — is already in the book's prior chapters. The MCP server is the thin layer that makes it all callable from a chat box.
+
+> **Production tip — log every tool call with the user query that triggered it.** When something goes wrong in production, you want to be able to answer "what did the user ask, what tool was called, what arguments were passed, what came back, and how long did it take?" The OpenTelemetry instrumentation in §6.8 covers most of this for free; the part you must add yourself is the *user prompt that led to the tool call*, which lives in the host LLM's conversation history and is not visible to the server unless the client forwards it. Some MCP clients support a `_meta` field on tool calls for exactly this purpose — use it.
+
+## 6.11 Chapter summary
+
+- **[MCP](https://modelcontextprotocol.io) is the standard interface** between LLM clients (Claude, Copilot, Cursor, JetBrains AI) and external systems. It defines four primitives: typed *tools*, URI-addressable *resources*, parameterised *prompts*, and typeahead *completions*, all over JSON-RPC.
+- **Solr is a natural fit for MCP** because Solr operations (search, index, facet, list collections, get schema, modify schema) map cleanly to MCP tools and resources, and Solr is the thing that lets LLMs stop guessing and start retrieving.
+- The **[Apache Solr MCP Server](https://github.com/apache/solr-mcp)** is a Spring Boot application built on **[Spring AI MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html)** and **SolrJ**. Today it exposes 13 tools (search, indexing in JSON/CSV/XML/file, schema introspection and modification, collection management, health, stats, ref-guide URL lookup), 2 resources (`solr://collections`, `solr://{collection}/schema`), 6 prompts (`explore-collections`, `setup-collection`, `view-schema`, `design-schema`, `index-data`, `search-collection`), and a `@McpComplete` typeahead bound to the schema resource template.
+- **The four `@Mcp…` annotations** — `@McpTool`, `@McpResource`, `@McpPrompt`, `@McpComplete` — are how Spring AI MCP makes you implement the four primitives. Tools are for the LLM to invoke; resources are for cheap grounding context; prompts let users trigger workflows as slash-commands; completions power typeahead pickers.
+- **STDIO mode needs no auth by design** — the client launches the server as a subprocess, so the OS process model is the trust boundary. The only STDIO-specific hazard is stdout hygiene (logs must go to stderr, banners must not exist), which is why images are built with [Jib](https://github.com/GoogleContainerTools/jib) rather than Buildpacks.
+- **HTTP mode is a network-exposed service** and needs the full web-security stack: OAuth2 with JWT validation (any OIDC provider — Auth0, Keycloak, Okta), input validation (local-param injection, field-name allowlisting, pagination bounds), and CORS locked to localhost by default. Authentication confirms *who*; validation confirms *what* — you need both.
+- **Observability** uses [OpenTelemetry](https://opentelemetry.io/) → LGTM (Grafana, Tempo, Loki, Mimir). Every tool invocation and every SolrJ call is traced; instrumentation is free via Spring Boot auto-config and `@Observed` annotations. STDIO mode cannot have observability because stdout is the wire.
+- **The server ships in two image flavours.** A JVM image built with [Jib](https://github.com/GoogleContainerTools/jib) for production deployments, and a [GraalVM](https://www.graalvm.org/) native-image variant (per transport) for sub-second cold start — critical for STDIO, where the server is launched per session.
+- **[Testcontainers](https://testcontainers.com/) plus a [Gradle](https://gradle.org/) version matrix** is how the project knows it works against the Solr versions you run, in both JVM and native flavours.
+- **When designing your own primitives**, prefer one verb per tool, constrain inputs with enums/resources/completions, return structured data the LLM can quote, lift multi-step orchestration into prompts, and add completions only where a human user will type. Always exercise new primitives in [MCP Inspector](https://github.com/modelcontextprotocol/inspector) against HTTP mode before pointing a real LLM client at them.
+- The shows collection from this book becomes a first-class thing an LLM can reason over — without your users ever seeing a Solr URL.
+
+---
