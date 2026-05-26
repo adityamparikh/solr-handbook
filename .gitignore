@@ -1,0 +1,13 @@
+_book/
+.quarto/
+chapters/*_files/
+*.aux
+*.log
+*.toc
+*.out
+*.lof
+*.lot
+.DS_Store
+
+/.quarto/
+**/*.quarto_ipynb

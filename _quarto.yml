@@ -1,0 +1,162 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Apache Solr: A Practical Engineering Handbook"
+  subtitle: "From Inverted Index to MCP — A Working Engineer's Companion"
+  author: "Aditya Parikh"
+  date: today
+  date-format: "MMMM YYYY"
+  publisher: "Self-published"
+  # cover-image: cover.png  # drop a cover.png next to _quarto.yml and uncomment to enable
+  # favicon: favicon.png
+  description: |
+    A practical, code-first handbook for working Java/Kotlin engineers building
+    on Apache Solr 10 — covering Lucene internals, schema design, search and
+    relevance engineering, SolrCloud operations, the Model Context Protocol
+    (MCP) integration, and an honest comparison with Elasticsearch and
+    OpenSearch.
+  search: true
+  repo-url: https://github.com/adityamparikh/solr-handbook  # adjust when published
+  repo-branch: main
+  sidebar:
+    style: docked
+    background: light
+    collapse-level: 1
+
+  chapters:
+    - index.qmd
+    - chapters/01-why-solr.qmd
+    - chapters/02-indexing.qmd
+    - chapters/03-search.qmd
+    - chapters/04-solrcloud.qmd
+    - chapters/05-relevance.qmd
+    - chapters/06-mcp.qmd
+    - chapters/07-alternatives.qmd
+    - part: "Back matter"
+      chapters:
+        - back-matter/closing.qmd
+        - back-matter/references.qmd
+        - back-matter/book-index.qmd
+
+# Cross-reference defaults — auto-numbering for figures and tables across the book.
+crossref:
+  fig-title: "Figure"
+  tbl-title: "Table"
+  fig-prefix: "Figure"
+  tbl-prefix: "Table"
+  title-delim: ":"          # caption package accepts only :, ., ' ', etc. — not em-dash
+  chapters: true            # number figures/tables as 6.1, 6.2, … (chapter.N)
+  labels: arabic
+
+# Don't auto-number section headings — the book uses manual 6.1, 6.2 numbering
+# in headings that cross-references in prose ("see §6.3") already depend on.
+number-sections: false
+
+# Manuscript-wide bibliography (optional — add solr-handbook.bib next to _quarto.yml).
+# bibliography: solr-handbook.bib
+# csl: chicago-author-date.csl
+
+format:
+  # ------------------------------------------------------------------
+  # HTML book site (default — `quarto render` builds this)
+  # ------------------------------------------------------------------
+  html:
+    theme:
+      light: cosmo
+      dark: darkly
+    code-fold: false
+    code-copy: true
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    fig-cap-location: bottom
+    tbl-cap-location: top
+    highlight-style: a11y
+    smooth-scroll: true
+    link-external-newwindow: true
+    mermaid:
+      theme: default
+
+  # ------------------------------------------------------------------
+  # Print-ready PDF (xelatex) — Letter, justified, classic book look
+  # ------------------------------------------------------------------
+  pdf:
+    documentclass: scrbook       # KOMA-Script book class — modern, configurable
+    classoption: [letterpaper, 11pt, twoside, openright, numbers=noenddot]
+    geometry:
+      - top=1in
+      - bottom=1.25in
+      - inner=1.25in
+      - outer=1in
+      - heightrounded
+    fontsize: 11pt
+    linestretch: 1.15
+    colorlinks: true
+    linkcolor: "blue!50!black"
+    citecolor: "green!50!black"
+    urlcolor: "blue!50!black"
+    fig-cap-location: bottom
+    tbl-cap-location: top
+    # Figure-fit defaults: keep images inside the 6"-wide Letter text block, scale
+    # anything wider to fit, prefer placement here-or-top so diagrams don't drift
+    # away from the prose that introduces them.
+    fig-pos: "H"
+    fig-width: 6
+    fig-height: 4
+    fig-align: center
+    out-width: "100%"
+    keep-tex: false
+    cite-method: biblatex
+    toc: true
+    toc-depth: 2
+    lof: false
+    lot: false
+    pdf-engine: xelatex
+    # Render Mermaid to PDF (vector — scales without aliasing in the printed page)
+    # at a 1000-pixel base width; LaTeX's out-width: 100% then fits it to the column.
+    mermaid:
+      theme: default
+    mermaid-format: pdf
+    include-in-header:
+      text: |
+        % Load TeX Gyre fonts via their LaTeX packages — works in xelatex
+        % without depending on Core Text / fontconfig font discovery.
+        \usepackage{tgpagella}      % main: Palatino-like
+        \usepackage{tgheros}        % sans: Helvetica-like
+        \usepackage{tgcursor}       % mono: Courier-like
+        \renewcommand{\familydefault}{\rmdefault}
+        \usepackage{microtype}      % subtle typography improvements
+        \usepackage{fvextra}        % better verbatim/code blocks
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+        \usepackage{xurl}           % allow URL line-breaks anywhere
+        % Force every image to fit the text block. Quarto computes per-image
+        % width/height from the PNG's pixel-dimensions ÷ DPI, which for Mermaid
+        % output often yields 10–15 inches — wider than the 6"-text Letter
+        % column. Wrapping every \includegraphics in \adjustbox{max width=…,
+        % max totalheight=…, keepaspectratio} caps both dimensions while
+        % preserving the aspect ratio. Smaller-than-text figures are unaffected.
+        \usepackage{graphicx}
+        \usepackage{adjustbox}
+        \let\origincludegraphics\includegraphics
+        \renewcommand{\includegraphics}[2][]{%
+          \adjustbox{max width=\linewidth,
+                     max totalheight=0.85\textheight,
+                     keepaspectratio}{\origincludegraphics[#1]{#2}}}
+
+  # ------------------------------------------------------------------
+  # Digital PDF (screen-first) — looser, hyperlinks-only navigation
+  # ------------------------------------------------------------------
+  # Render with: quarto render --to pdf --profile digital
+  # (requires _quarto-digital.yml override; or duplicate this block)
+
+  # ------------------------------------------------------------------
+  # EPUB e-book
+  # ------------------------------------------------------------------
+  epub:
+    toc: true
+    toc-depth: 2
+    # epub-cover-image: cover.png   # uncomment after dropping cover.png next to _quarto.yml
+    fig-cap-location: bottom
+    tbl-cap-location: top
