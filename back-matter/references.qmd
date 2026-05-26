@@ -1,0 +1,82 @@
+# References
+
+References are grouped by type. Throughout the book, the first mention of any source is linked inline; this section gathers the canonical URL for each so the inline citations can stay brief and the long-term locations can be updated in one place.
+
+### Official Apache documentation
+
+- **Apache Solr Reference Guide (latest).** <https://solr.apache.org/guide/solr/latest/>
+- **Apache Solr 10 Reference Guide (versioned).** <https://solr.apache.org/guide/solr/10_0/>
+- **Apache Solr News and downloads.** <https://solr.apache.org/news.html>
+- **Apache Solr Major Changes in 10.** <https://solr.apache.org/guide/solr/10_0/upgrade-notes/major-changes-in-solr-10.html>
+- **Apache Lucene 10.3 Javadoc — `org.apache.lucene.codecs.lucene103` package.** <https://lucene.apache.org/core/10_3_0/core/org/apache/lucene/codecs/lucene103/package-summary.html>
+- **Apache Solr Reference: Learning to Rank.** <https://solr.apache.org/guide/solr/latest/query-guide/learning-to-rank.html>
+- **Apache Solr Reference: Dense Vector Search.** <https://solr.apache.org/guide/solr/latest/query-guide/dense-vector-search.html>
+- **Apache Solr Reference: Suggester.** <https://solr.apache.org/guide/solr/latest/query-guide/suggester.html>
+- **Apache Solr Reference: Tokenizers and Filters.** <https://solr.apache.org/guide/solr/latest/indexing-guide/filters.html>
+- **Apache Solr Operator.** <https://solr.apache.org/operator/>
+
+### JIRA tickets cited in the text
+
+- **SOLR-8270 / SOLR-8271** — BM25Similarity becomes default (Solr 6).
+- **SOLR-9480** — `relatedness()` aggregation for JSON Faceting / Semantic Knowledge Graph.
+- **SOLR-12581** — `min_popularity` parameter for `relatedness()`.
+- **SOLR-14656** — Autoscaling framework removed (Solr 9.0).
+- **SOLR-17161** — SolrJ artifact split (`solr-solrj`, `solr-solrj-jetty`, `solr-solrj-zookeeper`, `solr-solrj-streaming`).
+- **SOLR-17319** — Native Reciprocal Rank Fusion (fix versions 10.1 and 9.11).
+- **SOLR-17780, SOLR-17812** — Scalar and binary quantized dense vectors.
+- **SOLR-17877** — Optional Overseer-less SolrCloud mode.
+- **SOLR-17892** — GPU-accelerated KNN via cuVS-Lucene codec.
+- **SOLR-18005** — `ConcurrentUpdateHttp2SolrClient` refactor → `ConcurrentUpdateJettySolrClient`.
+
+Browse: <https://issues.apache.org/jira/projects/SOLR>
+
+### Books
+
+- Grainger, T., Turnbull, D., & Irwin, M. (2025). *AI-Powered Search.* Manning. <https://www.manning.com/books/ai-powered-search>
+- Turnbull, D., & Berryman, J. (2016). *Relevant Search: With applications for Solr and Elasticsearch.* Manning.
+- Grainger, T., & Potter, T. (2014). *Solr in Action.* Manning.
+
+### Courses
+
+- **Udemy** — *Apache Solr 8* course (slug `learn-apache-solr-8`). The published curriculum for this course was used as a coverage benchmark when auditing Chapter 2 against a typical introductory-Solr syllabus, to make sure the operator-focused material in this book also covers the foundational concepts a working engineer would otherwise pick up from such a course. <https://www.udemy.com/course/learn-apache-solr-8/>
+
+### Papers
+
+- Malkov, Yu. A., & Yashunin, D. A. (2018). "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs." *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 42(4), 824–836. <https://arxiv.org/abs/1603.09320>
+- Grainger, T., AlJadda, K., Korayem, M., & Smith, A. (2016). "The Semantic Knowledge Graph: A compact, auto-generated model for real-time traversal and ranking of any relationship within a domain." *IEEE DSAA 2016.* <https://arxiv.org/abs/1609.00464>
+- Cormack, G. V., Clarke, C. L. A., & Büttcher, S. (2009). "Reciprocal rank fusion outperforms Condorcet and individual rank learning methods." *SIGIR 2009.* <https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf>
+
+### Blog posts and external references
+
+- Seeley, Y. (April 17, 2015). "Solr Facet Functions and Analytics: a new JSON Facet API." yonik.com.
+- Sease. "Exploring Solr Internals — The Lucene Inverted Index" (2015). <https://sease.io/2015/07/exploring-solr-internals-lucene.html>
+- McCandless, M. "Changing Bits" blog. <https://blog.mikemccandless.com/>
+- Blaszyk, J. "Exploring Apache Lucene — Part 1: The Index." <https://j.blaszyk.me/tech-blog/exploring-apache-lucene-index/>
+- Elastic. "The BM25 algorithm and its variables." <https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables>
+- Banon, S. (August 29, 2024). "Elasticsearch is Open Source, Again." Elastic blog.
+- Linux Foundation (September 16, 2024). "OpenSearch Software Foundation launch" press release.
+
+### Model Context Protocol (Chapter 6)
+
+- **MCP specification.** <https://modelcontextprotocol.io/specification>
+- **MCP GitHub organisation.** <https://github.com/modelcontextprotocol>
+- **MCP Inspector.** <https://github.com/modelcontextprotocol/inspector>
+- **Apache Solr MCP Server** (repository). <https://github.com/apache/solr-mcp>
+- **Elastic MCP Server.** <https://github.com/elastic/mcp-server-elasticsearch>
+- **OpenSearch MCP Server.** <https://github.com/opensearch-project/opensearch-mcp-server-py>
+- **Spring AI MCP** (Spring Boot integration). <https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html>
+- **Spring AI Community MCP Security** (OAuth2 support). <https://github.com/spring-ai-community/mcp-security>
+- **Claude Desktop.** <https://claude.ai/download>
+- **`mcp-remote`** (the OAuth2-aware bridge used by STDIO clients to reach HTTP servers). <https://github.com/geelen/mcp-remote>
+
+### Tooling
+
+- **Quepid** — relevance workbench. <https://github.com/o19s/quepid>
+- **Testcontainers Solr module.** <https://java.testcontainers.org/modules/solr/>
+- **Apache Solr Docker image.** <https://hub.docker.com/_/solr>
+- **Mermaid.** <https://mermaid.js.org/>
+- **Jib** (Docker images without a daemon). <https://github.com/GoogleContainerTools/jib>
+- **Grafana LGTM stack** (Loki, Grafana, Tempo, Mimir). <https://github.com/grafana/docker-otel-lgtm>
+- **OpenTelemetry.** <https://opentelemetry.io/>
+
+---

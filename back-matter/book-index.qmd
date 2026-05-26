@@ -1,0 +1,268 @@
+# Index
+
+The index is alphabetical by topic; bold entries point to the section where a concept is *defined*, regular entries to where it is *used*. Section numbers are stable across editions; page numbers (in PDF) shift with edits.
+
+### A
+
+- `add` modifier (atomic update), **§2.8.1**
+- `add-distinct` modifier (atomic update), **§2.8.1**
+- AffinityPlacementFactory, §4.11
+- aggregator node (distributed query), §4.9
+- aliases, collection — see *collection alias*
+- alias swap, blue/green, **§2.9.3**
+- analyzer chain, **§2.4**; index vs. query, §2.4; reindex implications, §2.9.1
+- ANN search — see *vector search*, *HNSW*
+- Apache Solr Operator, **§4.12**
+- atomic updates, **§2.8.1**; modifiers (`set`, `add`, `inc`, …), §2.8.1; vs. in-place, §2.8.2
+- autocomplete, **§3.11**; EdgeNGram, §3.11.2; SuggestComponent, §3.11.1
+- autoscaling framework (removed), **§4.11**
+
+### B
+
+- backup and restore, *not covered — see References for Apache docs*
+- batch indexing, **§2.6**
+- BM25 similarity, **§3.5**; default since Solr 6, §3.5; intuition, §1.5; parameters (`k1`, `b`), §3.5
+- block-join queries, mentioned in §2.8.4
+- blue/green reindex, **§2.9.3**
+- boost, eDisMax parameter, **§3.2**; multiplicative vs. additive (`bq` vs. `boost`), §3.2; signals, §5.3
+- boost capping, §5.3
+- boost query (`bq`), §3.2
+
+### C
+
+- cache thrash from over-committing, §2.10
+- caches (`filterCache`, `queryResultCache`, `documentCache`), §4.13
+- cardinality and faceting, §3.3
+- circuit breakers, §4.13
+- citation policy, *Preface — Conventions*
+- Claude Desktop (MCP client), **§6.5**, §6.6
+- Claude Code (MCP client), §6.6
+- CloudSolrClient, **§2.6**; URL-list constructor, §2.6
+- code repository for examples, *Copyright and edition*
+- Collapse query parser, **§3.9**; routing requirement, §3.9; vs. group=true, §3.9
+- collection, **§2.1**; vs. core, vs. replica, §2.1
+- collection alias, **§2.9.3**
+- Collections API in SolrJ, **§4.7**
+- commit (hard vs. soft), **§2.10**
+- compositeId routing, **§4.5**; prefix routing (`!`), §4.5, §3.9
+- ConcurrentUpdateJettySolrClient, §2.6; Solr 9 → 10 rename, §2.6
+- configset, **§4.8**
+- copyField, **§2.5**; destinations must be `stored=false`, §2.8.1
+- core (Solr), §2.1
+- cosine similarity, **§3.6** (illustrative example)
+- cuVS GPU codec, §3.6, §7.6 (experimental)
+- cursorMark, **§2.9.4**
+
+### D
+
+- debugging queries (`debug=true`, `[explain]`), **§3.10**
+- deletes (soft, live-docs bitset), §1.3
+- DenseVectorField, **§3.6**
+- diagram conventions, *Preface — Diagrams*
+- DisMax, §3.2
+- distributed query flow, **§4.9**
+- doc values, **§1.3**; required for sort/facet, §2.3; required for in-place updates, §2.8.2
+- Docker image (`apache/solr`), §2.7
+- document routing, **§4.5**
+- dynamicField, **§2.5**
+
+### E
+
+- eDisMax, **§3.2**; key parameters (`qf`, `pf`, `mm`, `tie`, `bq`, `boost`), §3.2
+- EdgeNGramFilterFactory, **§3.11.2**
+- elevate.xml, §5.6
+- Elasticsearch comparison, **Chapter 7**; licensing history, §7.1, §7.2
+- embedded Solr (not supported), §2.7
+- expand component, §3.9
+
+### F
+
+- faceting, **§3.3**; JSON Facet API, §3.3; `docValues=true` requirement, §3.3
+- feature logging (LTR), §5.4
+- feature store (LTR), §5.4
+- field properties (`indexed`, `stored`, `docValues`, …), **§2.3**
+- field types (`StrField`, `TextField`, point types), §2.3, §1.4.1
+- filter query (`fq`), §3.1
+- five data structures in a Lucene segment, **§1.3**
+- function queries, **§3.5**; doc-values backed, §1.4.8
+
+### G
+
+- geospatial search, *not covered*
+- GPU vector search (cuVS), §3.6, §7.6 (experimental)
+- graphs, HNSW — see *HNSW*
+
+### H
+
+- hard commit, **§2.10**
+- head queries, §5.3
+- highlighting, **§3.8**
+- HNSW (Hierarchical Navigable Small World graph), **§3.6**; greedy beam search, §3.6; layers and `efSearch`, §3.6
+- HttpJdkSolrClient, §2.6
+- hybrid retrieval, **§3.6**; rerank vs. RRF, §3.6
+
+### I
+
+- IDF (Inverse Document Frequency), §1.5, §3.5
+- in-place updates, **§2.8.2**; `update.partial.requireInPlace=true`, §2.8.2; criteria, §2.8.2
+- index, inverted — see *inverted index*
+- index conventions for this book, *Preface*
+- index-time vs. query-time analyzer, §2.4, §2.9.2
+- index-time vs. query-time boosting, §5.3
+- inverted index, **§1.2**, **§1.3**
+- ISBN, *Copyright and edition*
+
+### J
+
+- Java 21 (server) and Java 17 (SolrJ), §2.6
+- JetBrains IDEs (MCP client), §6.6
+- Jetty 12, §4.1
+- Jib (Docker image builder), **§6.9**
+- JSON Facet API, **§3.3**
+- JSpecify, *mentioned in style discussion only*
+- judgment lists, **§5.1**
+
+### K
+
+- `k1` parameter (BM25), **§3.5**, §1.5 (inverse intuition)
+- KNN — see *vector search*
+- Kubernetes (Solr Operator), **§4.12**
+
+### L
+
+- LatestVersionMergePolicyFactory, §2.11
+- leader election (SolrCloud), **§4.6**
+- learning to rank (LTR), **§5.4**; `LinearModel`, §5.4; `MultipleAdditiveTreesModel`, §5.4
+- length normalization (BM25 `b`), §1.5, §3.5
+- licensing comparison, **§7.2**
+- LinearModel, §5.4
+- live_nodes (ZooKeeper), §4.2
+- logging clicks, §5.2
+- Lucene 10.3, §4.1
+- Lucene file formats reference, §1.3, *References*
+
+### M
+
+- managed schema, **§2.2**
+- maxBooleanClauses, §1.4.4
+- MART (Multiple Additive Trees), §5.4
+- MCP — see *Model Context Protocol*
+- measurement (NDCG, MRR, MAP), **§5.1**
+- merging segments, **§2.11**
+- Mermaid, *Preface — Diagrams*
+- metrics (OpenTelemetry, Prometheus), §4.13
+- migration considerations (Solr ↔ ES/OS), §7.8
+- minimum-should-match (`mm`), §3.2
+- Model Context Protocol (MCP), **Chapter 6**; tool surface, **§6.3**; transport (STDIO vs HTTP), **§6.4**; quick start, **§6.5**; client integration, **§6.6**; ES and OpenSearch comparison, **§7.9**
+- multi-shard collections, §4.3, §3.9 (caveat with Collapse)
+
+### N
+
+- n-gram fields, §1.4.5
+- NDCG@k, **§5.1**; SolrJ implementation, §5.1
+- nested documents (block-join), §2.8.4
+- normalize casing on ingest, §1.4.1
+- NRT replica type, **§4.4**
+
+### O
+
+- OAuth2 (for MCP HTTP mode), **§6.7**; Auth0, §6.7; Keycloak, §6.7
+- observability (LGTM stack for MCP), **§6.8**
+- OpenSearch, **Chapter 7**; Foundation (Linux Foundation), §7.1; MCP server, §7.9
+- OpenTelemetry metrics, §4.13; in MCP server, §6.8
+- optimistic concurrency (`_version_`), **§2.8.3**
+- optimize (forced merge), §2.11
+- overseer, §4.1; overseer-less mode (SOLR-17877), §4.1
+
+### P
+
+- partial updates — see *atomic updates*, *in-place updates*
+- placement plugins, **§4.11**
+- positions (in postings), §1.3, §1.4.3
+- Postgres FTS comparison, **§1.7**
+- postings, **§1.3**; intersection (AND), §1.4.2
+- prefix query, **§1.4.4**; max boolean clauses, §1.4.4
+- PULL replica type, **§4.4**
+
+### Q
+
+- Quepid, **§5.1**
+- query anatomy (`q`, `fq`, `fl`, `sort`), **§3.1**
+- query elevation (editorial overrides), **§5.6**
+- query parsers, **§3.2**
+- query-time vs. index-time analyzer, §2.4
+
+### R
+
+- range query, **§1.4.7**
+- read-modify-write (optimistic concurrency), §2.8.3
+- Real-Time Get (RTG), §4.4 (NRT), §2.8.3
+- Reciprocal Rank Fusion (RRF), **§3.6**; client-side fallback, §3.6; native (SOLR-17319), §3.6
+- reindexing, **§2.9**; when required, §2.9.1; when not, §2.9.2; blue/green, §2.9.3; REINDEXCOLLECTION command, §2.9.3
+- relatedness() aggregation, **§5.5**
+- replica types (NRT, TLOG, PULL), **§4.4**
+- ReversedWildcardFilterFactory, §1.4.5
+- rolling commit policy, §2.10
+- routing — see *compositeId routing*
+
+### S
+
+- schema design, **§2.3**
+- seed dataset (the 30-show table), **§2.3**
+- segment, Lucene, **§1.3**, §2.11
+- semantic knowledge graph — see *`relatedness()` aggregation*
+- `set` modifier (atomic update), §2.8.1
+- `setNull` (clear field), §2.8.1
+- shards vs. replicas, **§4.3**
+- shards, scaling decision, §4.10
+- shows collection (the running example), **§2.3**
+- Solr MCP Server — see *Model Context Protocol*
+- Spring AI MCP, **§6.9**
+- STDIO transport (MCP), **§6.4**, §6.5
+- signals collection, **§5.2**
+- signals boosting, **§5.3**
+- similarity (per-field override), §3.5
+- soft commit, **§2.10**
+- SolrCloud, **Chapter 4**; default in Solr 10, §4.1
+- SolrJ (Maven coordinates, artifacts), §2.6
+- SolrContainer (Testcontainers), §2.7
+- spell checking, **§3.7**
+- standalone mode (`--user-managed`), §4.1
+- StrField case sensitivity, **§1.4.1**
+- Streaming Expressions, §5.2 (rollup, update, select)
+- SuggestComponent, **§3.11.1**
+- synonyms (query-time vs. index-time), §2.4, §2.9.2
+
+### T
+
+- term dictionary, **§1.3**; FST term index, §1.3
+- term frequency (TF), §1.5, §3.5
+- Testcontainers, **§2.7**
+- TF saturation (`k1`), §1.5
+- text analyzer chain, **§2.4**
+- time-routed aliases, *not covered*
+- TLOG replica type, **§4.4**
+- tlog (transaction log), §2.10
+- tokenizer, §2.4
+- TooManyClauses (prefix query rewrite), §1.4.4
+
+### U
+
+- uniqueKey, **§2.3**, §3.9 (Collapse)
+- update modifiers — see *atomic updates*
+- update.partial.requireInPlace, **§2.8.2**
+
+### V
+
+- vector field (DenseVectorField), **§3.6**
+- vector search (KNN), **§3.6**; quantization (scalar, binary), §3.6
+- version field (`_version_`), **§2.3**, §2.8.3; in-place requirement, §2.3
+- visibility (soft commit), §2.10
+
+### W
+
+- wildcard query, **§1.4.5**; embedded vs. leading, §1.4.5; n-gram alternative, §1.4.5
+
+### Z
+
+- ZooKeeper, **§4.2**; on dedicated nodes, §4.2; deprecated client-side connection, §2.6
