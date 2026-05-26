@@ -1,0 +1,441 @@
+# SolrCloud and Sharding
+
+> **What this chapter covers and why it matters.** Solr 10 is the version where SolrCloud finally stopped sharing the spotlight: standalone mode still exists behind a `--user-managed` flag, but cloud is the default and the future. This chapter covers the architecture, ZooKeeper's role, sharding/replication, replica types, leader election, document routing, the Collections API, scaling, and Kubernetes deployment with the Apache Solr Operator.
+>
+> **Prerequisites:** Chapter 2 (collections, schemas, configsets) and Chapter 3 (you should understand a distributed query before reading the distributed query *flow*).
+>
+> **You will learn:** Why SolrCloud needs ZooKeeper and what ZK actually stores; the differences between collections, shards, replicas, and cores; the three replica types (NRT, TLOG, PULL) and when to use each; how compositeId routing works (referenced in §3.9 Collapse); how leader election survives node failures; how to issue Collections API commands from SolrJ; how scatter-gather distributed queries actually work; and how to deploy a production cluster on Kubernetes with the Apache Solr Operator.
+>
+> **What you should not skip:** §4.4 (replica types — the most consequential design decision in a SolrCloud cluster) and §4.12 (Kubernetes deployment, including the honest assessment of the Operator's Solr 10 support).
+
+## 4.1 The Solr 10 cluster picture
+
+In Solr 10, *"bin/solr start now defaults to starting Solr in SolrCloud mode. Use the --user-managed switch to start in standalone (user-managed) mode instead"* (Major Changes in Solr 10). The community has been moving in this direction for years; the deprecation discussion on dev@solr.apache.org dates back to 2021.
+
+Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powered by Apache Lucene 10.3, with numerous small and large improvements."* The cluster runtime is on **Jetty 12** and **Jakarta EE 10**, the metrics subsystem migrated to **OpenTelemetry** (replacing Dropwizard), and several long-deprecated modules (jaegertracer-configurator, analytics, hadoop-auth) have been removed.
+
+> **Solr 9 differences — the platform shifted under your feet.** The big ones if you're upgrading from 9.x:
+> - **Java requirement.** Solr 10 server needs **Java 21**. Solr 9.x ran on Java 11+. (SolrJ on the client side still only needs Java 17 in 10.x.)
+> - **`bin/solr start` default.** In Solr 9, the default was standalone mode, and SolrCloud required `-c`. In Solr 10, the default is SolrCloud, and standalone requires `--user-managed`. Scripts written against 9 may need updating either way.
+> - **HTTP layer.** Jetty 12 (was 10) and Jakarta EE 10 (was `javax`). If you write custom plugins that touched servlet APIs, expect package renames (`javax.servlet.*` → `jakarta.servlet.*`).
+> - **Metrics.** Dropwizard → OpenTelemetry. Metric names changed from dot-delimited (`SEARCH.requestTimes.p95`) to snake_case (`search_request_times_p95`). Existing Prometheus dashboards will break.
+> - **`bin/solr delete`** no longer deletes a configset when you delete a collection — you must now explicitly pass `--delete-config`. In 9, a configset used by only one collection was deleted automatically.
+> - **Removed modules.** `jaegertracer-configurator`, `analytics`, `hadoop-auth`. If you used any of these, you need a replacement.
+
+```{mermaid}
+%%| label: fig-04-solrcloud-topology
+%%| fig-cap: "A SolrCloud cluster with three Solr nodes sharing cluster state via a ZooKeeper ensemble, with CloudSolrClient routing requests directly to any node."
+flowchart TB
+    subgraph ZK[ZooKeeper Ensemble - 3 or 5 nodes]
+        Z1[zk-0]
+        Z2[zk-1]
+        Z3[zk-2]
+    end
+    subgraph SC[SolrCloud - N Solr nodes]
+        S1[solr-0<br/>shard1 leader NRT<br/>shard2 NRT]
+        S2[solr-1<br/>shard1 NRT<br/>shard2 leader NRT]
+        S3[solr-2<br/>shard1 PULL<br/>shard2 PULL]
+    end
+    Client[SolrJ CloudSolrClient] -->|HTTP| S1
+    Client -->|HTTP| S2
+    Client -->|HTTP| S3
+    S1 <-->|state.json, live_nodes, configs| Z1
+    S2 <-->|state.json, live_nodes, configs| Z2
+    S3 <-->|state.json, live_nodes, configs| Z3
+    Z1 <--> Z2
+    Z2 <--> Z3
+    Z1 <--> Z3
+```
+
+## 4.2 What ZooKeeper stores
+
+For each collection ZooKeeper holds:
+
+- **`/live_nodes/`** — ephemeral znode per running Solr node.
+- **`/collections/<name>/state.json`** — shard map, replica list, leader pointer, replica states.
+- **`/configs/<configset>/`** — the configset (schema, solrconfig.xml, etc.) shared by collections.
+- **`/overseer_elect/`** — election znodes for the Overseer.
+- **`/aliases.json`**, **`/clusterprops.json`** — cluster-wide metadata.
+
+Solr is otherwise stateless: a node restart rebuilds its in-memory view from ZooKeeper.
+
+> **Production tip — run ZK on dedicated nodes with SSDs.** ZK fsyncs every write. Co-locating ZK with Solr means GC pauses in Solr's JVM can starve ZK's election traffic and cause spurious leader churn.
+
+### Solr 10's optional Overseer-less mode
+
+The Solr 10 release notes describe SOLR-17877: *"The SolrCloud Overseer is disable-able, in lieu of a simpler distributed mode of cluster command and collection state processing."* You enable it with the `overseerEnabled` cluster property or the `SOLR_CLOUD_OVERSEER_ENABLED` env var. *"In Solr 11, the Overseer might cease to exist, in an effort to simplify SolrCloud and maintenance."* For new deployments on Solr 10, **stay with the Overseer for now** — distributed mode is fine but the migration path is one-way.
+
+## 4.3 Collections, shards, replicas
+
+- **Collection** — a logical index. Has a schema, a number of shards, a configset, a router.
+- **Shard** — a horizontal slice of the collection. A document belongs to exactly one shard.
+- **Replica** — a physical copy of a shard, hosted on some node. One replica per shard is the **leader**; the others are followers.
+
+```{mermaid}
+%%| label: fig-04-shard-replica-layout
+%%| fig-cap: "A two-shard collection with hash-range partitioning and a mix of NRT leaders, NRT followers, and PULL replicas spread across three Solr nodes."
+flowchart LR
+    subgraph shows [Collection shows]
+      direction TB
+      sh1[shard1<br/>hash range 0 to 7FFFFFFF]
+      sh2[shard2<br/>hash range 80000000 to FFFFFFFF]
+    end
+    sh1 --> r1a[r1 NRT leader on solr-0]
+    sh1 --> r1b[r2 NRT on solr-1]
+    sh1 --> r1c[r3 PULL on solr-2]
+    sh2 --> r2a[r1 NRT leader on solr-1]
+    sh2 --> r2b[r2 NRT on solr-2]
+    sh2 --> r2c[r3 PULL on solr-0]
+```
+
+## 4.4 Replica types: NRT, TLOG, PULL
+
+The Solr reference guide defines them succinctly:
+
+- **NRT (Near Real Time)** — *"maintains a transaction log and updates its index locally. Replicas of type NRT support NRT (soft commits) and RTG. Any NRT replica can become a leader."* Indexes everything locally at write time; soft commits make new docs visible within seconds.
+- **TLOG** — *"maintains a transaction log but only updates its index via replication."* The leader forwards docs to TLOG replicas, which **append them to their own transaction log** and **pull segment files from the leader**. They do *not* run the analyzer chain or build segments locally for incoming writes; that CPU cost is paid only by the leader. The tlog exists so a TLOG replica can become the leader by replaying its log up to the latest version (peer sync) if the current leader fails.
+- **PULL** — *"does not maintain a transaction log and only updates its index via replication. This type is not eligible to become a leader."* Pure search replica. Cheapest replica type. Cannot become leader because it has no tlog to replay.
+
+| Replica type | Indexes from writes | Has tlog | Leader-eligible | Best for |
+|---|---|---|---|---|
+| NRT | yes (per-replica) | yes | yes | small clusters, near-real-time visibility |
+| TLOG | no — pulls segments; tlog tracks writes for failover | yes | yes | high indexing volume, save CPU on followers |
+| PULL | no — pulls segments only | no | no | scaling read throughput cheaply |
+
+: Comparison of the three SolrCloud replica types — NRT, TLOG, PULL — across local indexing, transaction log, leader eligibility, and the workload each one is best for. {#tbl-04-replica-types}
+
+The header "Indexes locally" in the old version of this table was easy to misread: TLOG replicas *do* write to local disk (their tlog and the pulled segments), they just don't run the analyzer pipeline on incoming writes. That CPU saving is the whole point of the type.
+
+Common production layouts:
+
+- **All-NRT (3 replicas/shard).** Simplest. Use when soft-commit visibility latency matters.
+- **TLOG leaders + PULL followers (1 TLOG + N PULL per shard).** Best for write-heavy, read-very-heavy workloads where seconds-of-staleness on followers is OK.
+- **NRT + PULL.** NRT for leader/indexing, PULL for additional query capacity. *Caveat from the Solr user list:* mixing NRT and PULL/TLOG can trigger full-index recoveries on PULL when an NRT leader changes, because NRT replicas of the same shard have differently-named segment files. Prefer pure TLOG+PULL or pure NRT layouts.
+
+## 4.5 Document routing
+
+Solr 10 supports two routers:
+
+- **`compositeId`** (default) — `murmur3(id) % shardCount` decides the shard. Prefix routing (`tenant1!doc-42`) lets you co-locate a tenant on a known shard.
+- **`implicit`** — you specify the shard at index time. You're on your own for routing logic. Useful when each shard represents a time bucket or a tenant.
+
+> **Production tip — pick a router up front and never change it.** Switching routers requires a full reindex into a new collection.
+
+## 4.6 Leader election and recovery
+
+```{mermaid}
+%%| label: fig-04-leader-election
+%%| fig-cap: "Leader election after a node crash: ZooKeeper watches fire, the lowest-sequenced follower wins the election znode race, peer-syncs with the survivor, and registers as the new leader."
+sequenceDiagram
+    participant N1 as Node A (leader)
+    participant N2 as Node B (replica)
+    participant N3 as Node C (replica)
+    participant ZK as ZooKeeper
+    Note over N1,ZK: Steady state - A is leader
+    N1->>ZK: ephemeral leader znode (session)
+    N1--xZK: Node A crashes, session expires
+    ZK-->>N2: watch fires
+    ZK-->>N3: watch fires
+    N2->>ZK: attempt CAS on /leader_elect
+    N3->>ZK: attempt CAS on /leader_elect
+    ZK-->>N2: you are next in line
+    N2->>N3: peer sync - compare tlog versions
+    N3-->>N2: tlog hash and version
+    N2->>ZK: register as new leader
+    Note over N2,N3: New leader, N3 follows
+```
+
+Leader election is a ZooKeeper sequential ephemeral-node race. The candidate with the lowest sequence number becomes leader after running a **peer sync** (compare tlog versions with peers; if too far behind, do a full **replication recovery** from the new leader).
+
+The replica recovery state machine:
+
+```{mermaid}
+%%| label: fig-04-replica-recovery
+%%| fig-cap: "The replica recovery state machine: a node transitions from DOWN through RECOVERING to ACTIVE, falling back to RECOVERY_FAILED with retry on peer-sync failure."
+stateDiagram-v2
+    [*] --> DOWN
+    DOWN --> RECOVERING : node came up
+    RECOVERING --> ACTIVE : peer sync OK
+    RECOVERING --> RECOVERY_FAILED : peer sync failed
+    RECOVERY_FAILED --> RECOVERING : retry with backoff
+    ACTIVE --> DOWN : node lost
+```
+
+## 4.7 The Collections API in SolrJ
+
+```java
+import org.apache.solr.client.solrj.request.CollectionAdminRequest;
+import org.apache.solr.client.solrj.response.CollectionAdminResponse;
+import org.apache.solr.common.cloud.Replica;
+
+// Create
+CollectionAdminRequest.Create create =
+    CollectionAdminRequest.createCollection("shows", "shows_configset", 4, 2);
+create.process(client);
+
+// Reload (after configset change)
+CollectionAdminRequest.reloadCollection("shows").process(client);
+
+// Split a shard
+CollectionAdminRequest.splitShard("shows").setShardName("shard1").process(client);
+
+// Add a replica
+CollectionAdminRequest.addReplicaToShard("shows", "shard1")
+    .setType(Replica.Type.PULL)
+    .process(client);
+
+// Delete replica
+CollectionAdminRequest.deleteReplica("shows", "shard1", "core_node3").process(client);
+
+// Delete collection
+CollectionAdminRequest.deleteCollection("shows").process(client);
+```
+
+In Solr 10, *"the bin/solr delete command no longer deletes a configset when you delete a collection. Previously if you deleted a collection, it would also delete its associated configset if it was the only user of it. Now you have to explicitly provide a --delete-config option."* This decouples configset lifecycle from collection lifecycle — a welcome change for shared configsets.
+
+## 4.8 ConfigSets
+
+A configset is a directory of `managed-schema.xml`, `solrconfig.xml`, `synonyms.txt`, stopword files, etc. In SolrCloud it lives in ZooKeeper under `/configs/<name>/`. You upload one with `bin/solr zk upconfig` or the Configset API and reference it at collection-create time.
+
+```bash
+bin/solr zk upconfig -n shows_configset -d /path/to/local/configset -z zk-0:2181
+```
+
+> **Production tip — version your configsets in git, deploy them with a CI pipeline that calls `zk upconfig` and then `RELOAD COLLECTION`.** This gives you reviewable schema changes and atomic rollouts.
+
+## 4.9 Distributed query flow
+
+```{mermaid}
+%%| label: fig-04-distributed-query
+%%| fig-cap: "The two-phase distributed query: every shard returns top-K IDs in parallel, the aggregator merges to a global top-K, then refetches full documents only for the survivors."
+sequenceDiagram
+    participant C as Client (CloudSolrClient)
+    participant N as Receiving node (any node)
+    participant L1 as shard1 replica
+    participant L2 as shard2 replica
+    participant L3 as shard3 replica
+    C->>N: GET /solr/shows/select?q=...
+    Note over N: Phase 1 - top-K IDs from each shard
+    par
+        N->>L1: distrib=false, fl=id score, rows=20
+        L1-->>N: 20 IDs and scores
+    and
+        N->>L2: distrib=false, fl=id score, rows=20
+        L2-->>N: 20 IDs and scores
+    and
+        N->>L3: distrib=false, fl=id score, rows=20
+        L3-->>N: 20 IDs and scores
+    end
+    Note over N: Merge to global top 20 by score
+    Note over N: Phase 2 - fetch full fields for global top-K
+    par
+        N->>L1: ids=[...]
+        L1-->>N: docs
+    and
+        N->>L2: ids=[...]
+        L2-->>N: docs
+    end
+    N-->>C: merged response
+```
+
+This **two-phase distributed search** is a Lucene/Solr classic: phase 1 gets IDs+scores from every shard, phase 2 pulls the full documents only for the global top-K. Faceting is similarly two-phased with refinement to fix counts at shard boundaries.
+
+> **Production tip — the receiving node is the aggregator.** Use `CloudSolrClient` so the client picks a node intelligently (it can prefer leaders for indexing or follow `shards.preference` for queries).
+
+## 4.10 Scaling: when to add shards vs. replicas
+
+| Symptom | Add shards | Add replicas |
+|---|---|---|
+| Index too big for one node's disk / RAM | yes | no |
+| Indexing throughput is the bottleneck | yes | depends |
+| Query QPS is the bottleneck | no | yes |
+| Query latency is high at low QPS | yes (parallelism) | no |
+| Need higher availability | no | yes |
+
+: Decision matrix for whether a given scaling symptom calls for adding shards, adding replicas, or both. {#tbl-04-scaling-decision}
+
+**Sharding has a cost**: every distributed query fans out to every shard. Below ~50–100M docs per shard, additional shards usually hurt latency more than they help. The sweet spot in 2026 is typically 50M–200M docs per shard.
+
+## 4.11 Replacement for the (removed) autoscaling framework
+
+In Solr 9.0 the entire autoscaling framework was removed (SOLR-14656): *"Autoscaling framework removed. This includes: Autoscaling, policy, triggers etc."* It was widely regarded as too complex and unreliable.
+
+What replaces it in Solr 9+ and continues into Solr 10:
+
+1. **Replica Placement Plugins.** A pluggable API for *where to put a replica* on collection create / replica add. Stock implementations:
+   - `AffinityPlacementFactory` — respects availability zones, replica types, disk usage. The default for production. As of Solr 9.1, default `minimalFreeDiskGB` is 20.
+   - `MinimizeCoresPlacementFactory` — pure load balancing.
+   - `RandomPlacementFactory` — testing.
+2. **Node Roles.** A node can have role `overseer`, `data`, or both — letting you dedicate nodes to coordination vs. indexing/serving.
+3. **External orchestration.** True auto-scaling (adding/removing nodes in response to load) is now an *operational* concern, not a Solr-internal one. On Kubernetes the Solr Operator (§4.12) plus HPA handles this. On VMs you script it.
+
+Configure `AffinityPlacementFactory` once per cluster:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+    'http://solr-0:8983/api/cluster/plugin' \
+    --data '{
+      "add": {
+        "name": ".placement-plugin",
+        "class": "org.apache.solr.cluster.placement.plugins.AffinityPlacementFactory",
+        "config": {
+          "minimalFreeDiskGB": 20,
+          "prioritizedFreeDiskGB": 100
+        }
+      }
+    }'
+```
+
+Then set the `availability_zone` and `replica_type` system properties on each Solr node (`-Davailability_zone=us-east-1a -Dreplica_type=tlog`) and the placement plugin honors them.
+
+## 4.12 Kubernetes with the Apache Solr Operator
+
+The **Apache Solr Operator** is the canonical way to run SolrCloud on Kubernetes. Per the Apache Solr homepage (solr.apache.org), the latest GA is *"Apache Solr Operator™ v0.9.1 available (25.Mar)"* — released March 25, 2025.
+
+⚠️ **Solr 10 compatibility caveat.** As of May 2026, **no v0.10.x release with explicit Solr 10 support has been published**. A `v0.10.0-prerelease` exists on the `main` branch (referenced in upgrade docs), and GitHub issue #821 (March 16, 2026) explicitly asks for clarification on whether v0.9.1 supports Solr 10. The official compatibility matrix still lists "Solr 9.4+". Running Solr 10 images under operator v0.9.1 is unsupported/experimental. For production: either pin Solr 9.10.x until operator v0.10.0 GA lands, or accept the experimental status and test thoroughly.
+
+### Install (current released v0.9.1)
+
+```bash
+helm repo add apache-solr https://solr.apache.org/charts
+helm repo update
+kubectl create -f https://solr.apache.org/operator/downloads/crds/v0.9.1/all-with-dependencies.yaml
+helm install solr-operator apache-solr/solr-operator --version 0.9.1
+```
+
+### Production SolrCloud CR
+
+The CRD is still `apiVersion: solr.apache.org/v1beta1` — beta-versioned, per the operator README: *"The API Version is still beta (v1beta1), and minor versions can have backwards-incompatible API changes. However, the Solr Operator will always have upgrade paths that are backwards-compatible."*
+
+```yaml
+apiVersion: solr.apache.org/v1beta1
+kind: SolrCloud
+metadata:
+  name: prod-solr
+  namespace: solr
+spec:
+  replicas: 3
+  solrImage:
+    repository: solr
+    tag: "10.0.0"          # experimental under v0.9.1 - see caveat above
+    pullPolicy: IfNotPresent
+
+  # JVM
+  solrJavaMem: "-Xms4g -Xmx4g"
+  solrOpts:   "-XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+  # External (provided) ZK ensemble - recommended for production
+  zookeeperRef:
+    connectionInfo:
+      externalConnectionString: "zk-0.zk-hs.zk.svc:2181,zk-1.zk-hs.zk.svc:2181,zk-2.zk-hs.zk.svc:2181"
+      chroot: "/prod-solr"
+
+  # Persistent storage per pod
+  dataStorage:
+    persistent:
+      reclaimPolicy: Retain
+      pvcTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "ssd"
+          resources:
+            requests:
+              storage: "100Gi"
+
+  customSolrKubeOptions:
+    podOptions:
+      resources:
+        requests: { cpu: "2", memory: "6Gi" }
+        limits:   { cpu: "4", memory: "8Gi" }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: solr-cloud
+                    operator: In
+                    values: ["prod-solr"]
+              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: solr-cloud
+                      operator: In
+                      values: ["prod-solr"]
+                topologyKey: topology.kubernetes.io/zone
+
+  solrAddressability:
+    podPort: 8983
+    commonServicePort: 80
+```
+
+The Apache Solr Operator GKE walkthrough recommends, for production deployments, defining the `ZookeeperCluster` outside the SolrCloud CR and pointing to it via `spec.zookeeperRef.connectionInfo`. The pod anti-affinity above spreads pods across nodes (required) and prefers spreading them across zones (preferred). Pods carry the `solr-cloud=<name>` label automatically.
+
+```{mermaid}
+%%| label: fig-04-k8s-operator-topology
+%%| fig-cap: "How the Apache Solr Operator turns a SolrCloud custom resource into a StatefulSet of Solr pods with PVCs, a headless service, and an external ZooKeeper ensemble."
+flowchart TB
+    subgraph K8s[Kubernetes Cluster]
+        OP[solr-operator Pod]
+        subgraph ns[Namespace - solr]
+            CR[SolrCloud CR<br/>kind=SolrCloud]
+            SS[StatefulSet prod-solr]
+            P0[Pod solr-0 + PVC]
+            P1[Pod solr-1 + PVC]
+            P2[Pod solr-2 + PVC]
+            SVC[Service solr-headless]
+        end
+        subgraph ZK[Namespace - zk]
+            ZK0[zk-0]
+            ZK1[zk-1]
+            ZK2[zk-2]
+        end
+    end
+    OP -- watches --> CR
+    OP -- creates --> SS
+    SS --> P0
+    SS --> P1
+    SS --> P2
+    P0 --> ZK0
+    P1 --> ZK1
+    P2 --> ZK2
+    Client[App] --> SVC
+    SVC --> P0
+    SVC --> P1
+    SVC --> P2
+```
+
+The operator handles: StatefulSet creation, headless service, PVC templates, rolling restarts on config change, TLS cert mounting, optional Prometheus exporter sidecar, and (in newer versions) managed scale up/scale down with replica balancing on Solr 9.3+.
+
+## 4.13 Monitoring
+
+Solr 10 *"migrated from Dropwizard metrics to OpenTelemetry (OTEL) for observability. This migration provides native Prometheus support, OTLP support, exemplar support for tracing correlation, and native attributes and labels on all metrics. All metrics have been migrated to snake-case metric names instead of dot-delimited format"* (Major Changes in Solr 10).
+
+The `/admin/metrics` API now defaults to Prometheus exposition format. Pipe it into Prometheus + Grafana, or push OTLP to your tracing backend. Standard dashboards to build:
+
+- **QPS** per collection, p50/p95/p99 latency
+- **Indexing rate** and tlog size
+- **Cache** hit ratios (queryResultCache, filterCache, documentCache)
+- **GC pauses** and heap usage
+- **Replica state** (active/recovering/down)
+- **Circuit breaker** trips (CPU load average, memory)
+
+## Exercises
+
+1. **Size a cluster.** A streaming-content catalog has 80M documents (~3 KB average), receives 200 indexing writes/sec at peak, and serves 5,000 queries/sec at peak with p95 latency target 200 ms. Specify: number of shards, replica types and counts per shard, node count, JVM heap per node, and disk per node. Justify each number using §4.4 and §4.10.
+2. **Choose replicas for a workload.** Three workloads: (a) a logging cluster ingesting 50K events/sec with hourly query traffic; (b) a product search bar serving 2,000 QPS with hourly bulk reindexes; (c) an internal admin search used by 50 employees. For each, choose between all-NRT, TLOG+PULL, or NRT+PULL, and explain the tradeoff you're making.
+3. **Trace a failover.** Walk through the leader-election sequence (§4.6) when the current leader of `shard1` of a 3-replica collection (1 NRT leader, 2 NRT followers) crashes. At each step, identify which ZooKeeper znode changes, which Solr node takes which action, and how long the collection is unavailable for writes.
+4. **Build the Kubernetes spec.** Adapt the SolrCloud CR in §4.12 for a 5-node cluster spread across 3 availability zones with 200 GB SSD per pod and a separate ZK ensemble. Add an Ingress for the Admin UI. Validate that your anti-affinity rules prevent two replicas of the same shard from landing on the same node.
+
+## 4.14 Chapter summary
+
+- Solr 10 makes SolrCloud the default; standalone survives as `--user-managed`. Underlying engine: Lucene 10.3, Jetty 12, Java 21 server.
+- ZooKeeper holds cluster state and configsets; keep it on dedicated nodes. Overseer-less mode is opt-in in Solr 10 (likely default in 11).
+- Three replica types — NRT, TLOG, PULL — let you trade indexing latency vs. CPU and high-availability.
+- The Collections API in SolrJ is your control plane for creating, splitting, reloading collections.
+- The removed autoscaling framework is replaced by **Replica Placement Plugins** + external orchestration (Kubernetes Operator + HPA).
+- Production Kubernetes deployment uses the **Apache Solr Operator** (current GA: v0.9.1; v0.10.x with first-class Solr 10 support is in development) with an externally-managed ZooKeeper ensemble, persistent storage, pod anti-affinity, and OpenTelemetry/Prometheus monitoring.
+
+---
