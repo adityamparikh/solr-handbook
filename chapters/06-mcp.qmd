@@ -49,10 +49,11 @@ The reference implementation we cover here is the **[Apache Solr MCP Server](htt
 ```text
 org.apache.solr.mcp.server
 ├── Main.java                        // Spring Boot entry point, profile-driven
-├── collection/CollectionService     // list-collections, create-collection, completions
-├── indexing/IndexingService         // index-json / -csv / -xml
-├── schema/SchemaService             // get-schema, add-fields, add-field-types
-└── search/SearchService             // search
+├── collection/CollectionService     // list/create/stats/health-collection + completions
+├── indexing/IndexingService         // index-json / -csv / -xml + index-data prompt
+├── schema/SchemaService             // get-schema, add-fields, add-field-types + prompts
+├── search/SearchService             // search + search-collection prompt
+└── util/PromptNames, PromptText     // centralised prompt names + template bodies
 ```
 
 The component graph:
@@ -207,10 +208,12 @@ What it does *not* expose: `defType` (parser selection), `qf`/`pf`/`mm`/`bq`/`bo
 
 A resource is a URI-addressable, read-only blob. Resources let an MCP client *ground* the LLM in cheap, side-effect-free context without spending a tool call.
 
-| Resource URI | Content | Annotation |
-|---|---|---|
-| `solr://collections` | JSON list of collection names. | `@McpResource(uri = "solr://collections")` |
-| `solr://{collection}/schema` | JSON schema dump for `{collection}`. | `@McpResource(uri = "solr://{collection}/schema")` |
+| Resource URI | Resource name | MIME type | Content |
+|---|---|---|---|
+| `solr://collections` | `solr-collections` | `application/json` | JSON list of collection names. |
+| `solr://{collection}/schema` | `solr-collection-schema` | `application/json` | JSON schema dump for `{collection}`. |
+
+: The two MCP resources, each declared with `@McpResource(uri = …, name = …, mimeType = "application/json")`. The stable `name` is what clients show in the resource picker; the `uri` is what they `read`. {#tbl-06-resources}
 
 URI templates use [RFC 6570](https://datatracker.ietf.org/doc/html/rfc6570) syntax. Spring AI binds the path variables to method parameters by name:
 
@@ -245,6 +248,8 @@ The Solr MCP Server exposes six prompts, one per common workflow:
 
 : The six built-in MCP prompts, the arguments each one takes, and the multi-tool workflow each one directs the LLM to follow. {#tbl-06-prompts}
 
+All six prompts (and the completions in §6.3.4) landed together in a single change — the server's prompt-and-completion layer is its newest surface, added on top of the tool/resource core. Each `@McpPrompt` also carries a human-readable `title` (e.g. *"Set up a new Solr collection"*) that clients render in the prompt picker, and an `@PreAuthorize("isAuthenticated()")` guard so that in HTTP mode (§6.7.2) an unauthenticated caller can't even enumerate the workflows. The prompt **names** are centralised in a `PromptNames` utility and the template bodies in `PromptText`, so the prompt strings and the `@McpComplete` bindings that reference them (§6.3.4) can never drift apart.
+
 Each prompt returns a `String` that the framework wraps as a single user-role `PromptMessage`. The templates *don't* do the work themselves — they instruct the LLM which tools to call, in what order, with which arguments. They are the seams that let a single user gesture (`/index-data shows json`) compose into a sequence of MCP tool calls.
 
 ```java
@@ -271,11 +276,34 @@ The body interpolates the live `DEFAULT_CONFIGSET` / `DEFAULT_NUM_SHARDS` / `DEF
 
 A completion is a typeahead provider. It does not invoke anything; it suggests values for a prompt argument or a resource-URI variable as the user types. Clients with prompt pickers or resource pickers (MCP Inspector is the canonical one) hit `completion/complete` and render the suggestions in a dropdown.
 
-The Solr MCP Server has five completion handlers, all sharing one data path: one bound to the `solr://{collection}/schema` resource template, plus four prompt-argument wrappers (for the `search-collection`, `index-data`, `view-schema`, and `design-schema` prompts) that delegate to it. The resource-template handler:
+The Solr MCP Server now ships **five** completions — every one of which suggests **collection names**, and every one of which delegates to the same underlying `completeCollection(prefix)` helper. They differ only in *where* they're bound. One is bound to a resource-URI variable; the other four are bound to the `collection` argument of the four prompts that take one:
+
+| `@McpComplete` binding | Surface it powers | Argument completed |
+|---|---|---|
+| `uri = "solr://{collection}/schema"` | the schema **resource** template picker | `collection` |
+| `prompt = SEARCH_COLLECTION` | `/search-collection` slash-command | `collection` |
+| `prompt = INDEX_DATA` | `/index-data` slash-command | `collection` |
+| `prompt = VIEW_SCHEMA` | `/view-schema` slash-command | `collection` |
+| `prompt = DESIGN_SCHEMA` | `/design-schema` slash-command | `collection` |
+
+: The five `@McpComplete` handlers. All complete collection names from the live cluster; they exist as separate handlers because MCP registers one completion per `(reference, argument-name)` pair — a resource handler does **not** transparently cover a prompt argument of the same name. {#tbl-06-completions}
+
+The single shared implementation:
 
 ```java
 @McpComplete(uri = "solr://{collection}/schema")
-public List<String> completeCollectionName(CompleteRequest.CompleteArgument arg)
+public List<String> completeForSchemaResource(CompleteRequest.CompleteArgument arg)
+        throws SolrServerException, IOException {
+    return completeCollection(arg);
+}
+
+@McpComplete(prompt = PromptNames.SEARCH_COLLECTION)
+public List<String> completeForSearchPrompt(CompleteRequest.CompleteArgument arg)
+        throws SolrServerException, IOException {
+    return completeCollection(arg);              // …and three more identical wrappers
+}
+
+private List<String> completeCollection(CompleteRequest.CompleteArgument arg)
         throws SolrServerException, IOException {
     if (!"collection".equals(arg.name())) return List.of();
     String prefix = arg.value() == null ? "" : arg.value().toLowerCase(Locale.ROOT);
@@ -289,15 +317,15 @@ public List<String> completeCollectionName(CompleteRequest.CompleteArgument arg)
 
 A handful of design points worth pinning:
 
-- **Guard on the argument name.** The URI template has one variable (`collection`), but a future template might have more. Match on `arg.name()` so completion only fires for the variable you mean.
+- **One handler per `(reference, argument-name)` pair.** This is the reason there are five thin handlers rather than one. MCP dispatches `completion/complete` by the *reference* being completed (a specific resource URI template, or a specific prompt) **and** the argument name. Binding to the `solr://{collection}/schema` resource does nothing for the `collection` argument of the `/search-collection` prompt — that's a different reference. So the server registers a wrapper per surface and funnels them all to one helper.
+- **Guard on the argument name.** Each handler still checks `arg.name()` before doing work, so it only fires for the `collection` variable even if a prompt later grows a second argument.
 - **Filter by prefix, sort stably, cap the response.** The MCP spec budgets a small list of completions per request; sending 10,000 collection names is both wasteful and unusable. 100, sorted, lowercase-prefix-filtered is the sweet spot.
-- **Re-use the underlying tool's data path.** The completion above calls the same `listCollections()` that the `list-collections` tool calls. One data path, two surfaces; no separate cache, nothing to invalidate.
+- **Re-use the underlying tool's data path.** Every completion calls the same `listCollections()` that the `list-collections` tool calls. One data path, six surfaces; no separate cache, nothing to invalidate.
+- **Not everything gets a completion.** `setup-collection`'s `name` argument is deliberately *not* completed — it names a collection that does not exist yet, so suggesting existing names would be actively misleading. `explore-collections` takes no arguments at all. Completion is for picking from a known set, not for inventing a new value.
 
-The prompt-argument variant works the same way: `@McpComplete(prompt = "search-collection")` powers the dropdown when the user types into the `collection` arg of the `/search-collection` slash-command — that's what the four wrapper handlers do, each a one-line delegation to the method above.
+> **Tool vs Completion — when each wins.** A *tool* is for the LLM. A *completion* is for the *client's typeahead UI*. They can be backed by the same underlying call; the distinction is who's consuming the result. If only your LLM ever needs the data, skip completion — `list-collections` already covers that. Add completion when a human user types into a picker — and add one *per surface*, because each prompt argument and each resource variable is its own MCP reference.
 
-> **Tool vs Completion — when each wins.** A *tool* is for the LLM. A *completion* is for the *client's typeahead UI*. They can be backed by the same underlying call; the distinction is who's consuming the result. If only your LLM ever needs the data, skip completion — `list-collections` already covers that. Add completion when a human user types into a picker.
-
-That's the entire user-visible API: 11 tools, 2 resources, 6 prompts, 5 completion handlers. No LTR tool, no signals tool, no `relatedness()` tool — yet. §6.10 covers how you'd add them.
+That's the entire user-visible API: 11 tools, 2 resources, 6 prompts, 5 completions. No LTR tool, no signals tool, no `relatedness()` tool — yet. §6.10 covers how you'd add them.
 
 ## 6.4 Transport modes: STDIO vs HTTP
 
@@ -449,6 +477,23 @@ For HTTP mode, swap the contents:
 }
 ```
 
+If you'd rather not hand-edit the file, the `claude mcp add` CLI writes the same entry. These are the exact invocations the server's README documents — STDIO via Docker, STDIO via the local jar (with `SOLR_URL` passed through `-e`), and HTTP against an already-running server:
+
+```bash
+# STDIO, Docker image (pass SOLR_URL into the container with docker's own -e)
+claude mcp add --transport stdio solr-mcp \
+    -- docker run -i --rm -e SOLR_URL=http://host.docker.internal:8983/solr/ \
+       ghcr.io/apache/solr-mcp:latest
+
+# STDIO, local jar — the jar runs on the host, so plain localhost works.
+# `claude mcp add -e` sets the env of the java process directly (before the `--`).
+claude mcp add --transport stdio -e SOLR_URL=http://localhost:8983/solr/ solr-mcp \
+    -- java -jar /absolute/path/to/solr-mcp-1.0.0-SNAPSHOT.jar
+
+# HTTP, connect to a running server
+claude mcp add --transport http solr-mcp http://localhost:8080/mcp
+```
+
 ### VS Code (`.vscode/mcp.json`)
 
 ```json
@@ -499,6 +544,8 @@ PROFILES=http
 OAUTH2_ISSUER_URI=https://your-provider.example.com/
 # HTTP_SECURITY_ENABLED=false   # local dev only
 ```
+
+(The variable is `HTTP_SECURITY_ENABLED`, which maps to the `http.security.enabled` property and defaults to `true` whenever the `http` profile is active — you set it to `false` only to *disable* auth for local debugging, never in production.)
 
 The server then:
 
@@ -649,9 +696,53 @@ Two practical wrinkles to know:
 
 That tested-version matrix is the only credible way to know whether the MCP server actually works against the Solr you run in production — and the only way to catch native-image breakage before it ships, since reflection regressions only surface at runtime.
 
+### 6.9.6 [CycloneDX](https://cyclonedx.org/) SBOM for supply-chain transparency
+
+An MCP server sits in a privileged spot: it holds Solr credentials, runs arbitrary queries on the LLM's behalf, and (in HTTP mode) is network-exposed. Anyone deploying it has a right to ask *exactly what's inside the artifact* — every transitive dependency, with versions, so they can scan it against CVE feeds. That's what a **Software Bill of Materials (SBOM)** is for, and the project is adding one via the **[CycloneDX](https://cyclonedx.org/) Gradle plugin** ([`org.cyclonedx.bom`](https://github.com/CycloneDX/cyclonedx-gradle-plugin), version 2.4.1 — the version Spring Initializr pairs with the Spring Boot `sbom-cyclone-dx` starter).
+
+> **Note — landing via an open PR.** As of this writing the SBOM work is in flight as an open pull request, not yet merged to `main`. The mechanism below is what it introduces; treat the exact paths as current-as-proposed and check the repo for the merged form.
+
+The wiring is deliberately minimal. The plugin is declared in the version catalog and applied with no explicit configuration block — it leans entirely on Spring Boot's CycloneDX auto-configuration, which is what keeps the format and output path predictable:
+
+```toml
+# gradle/libs.versions.toml
+[versions]
+cyclonedx-plugin = "2.4.1"
+
+[plugins]
+cyclonedx = { id = "org.cyclonedx.bom", version.ref = "cyclonedx-plugin" }
+```
+
+```kotlin
+// build.gradle.kts — one line in the plugins block; no cyclonedxBom { } config
+plugins {
+    alias(libs.plugins.cyclonedx)
+}
+```
+
+That gives you a **CycloneDX JSON 1.6** document, generated by the standard `cyclonedxBom` task:
+
+```bash
+./gradlew cyclonedxBom        # → build/reports/application.cdx.json
+```
+
+Four things fall out of the Spring Boot integration, and together they're why this is more than a CI checkbox:
+
+- **Embedded in the bootable JAR.** The Spring Boot Gradle plugin makes `bootJar` depend on `cyclonedxBom` and bundles the result at `META-INF/sbom/application.cdx.json` inside the jar. The SBOM travels *with* the artifact, not as a side file someone has to remember to ship.
+- **Free coverage for every image flavour.** Because the Jib JVM image and both Paketo native images (§6.9.3–6.9.4) package the same bootJar contents, the embedded SBOM rides along into all three — no per-image wiring. (The plugin reports the Gradle dependency graph, which is what ends up in the GraalVM binary too, so the native images are covered by the same manifest.)
+- **Served at runtime, HTTP mode only.** With `management.endpoint.sbom.enabled=true`, the Actuator exposes the SBOM at `GET /actuator/sbom/application` (content type `application/vnd.cyclonedx+json`). A running server can hand a scanner its own bill of materials — handy for a deployed fleet you want to audit live.
+- **Attached to releases and CI artifacts.** The release workflow runs `./gradlew cyclonedxBom`, uploads `application.cdx.json` as a build artifact, and attaches it to the GitHub Release as `solr-mcp-<version>.cdx.json`; the build workflow uploads it on every run. Consumers can scan the SBOM directly:
+
+```bash
+trivy sbom application.cdx.json          # CVE scan from the SBOM alone
+grype sbom:application.cdx.json          # same, with a second scanner
+```
+
+What this deliberately does *not* include yet: **no SPDX** (CycloneDX JSON only), and **no signing or provenance** — [cosign](https://github.com/sigstore/cosign) signatures and [SLSA](https://slsa.dev/) attestation are noted as future follow-ups, not part of the first cut. An unsigned SBOM still answers "what's in here?"; it just doesn't yet prove "and here's cryptographic evidence it wasn't tampered with." That's the right order to build it in — generate first, attest later.
+
 ## 6.10 Designing primitives for an LLM to use well
 
-The Solr MCP Server's 11 tools, 6 prompts, 2 resources, and 5 completion handlers are a starting set, not a ceiling. If you're building your own primitives (which you should: this is the gap chapter for the MCP book in the series), the design rules vary by primitive type. The first three rules below apply to *tools* — they're the highest-stakes surface because the LLM picks them autonomously. The fourth and fifth cover prompts and completions.
+The Solr MCP Server's 11 tools, 6 prompts, 2 resources, and 5 completions are a starting set, not a ceiling. If you're building your own primitives (which you should: this is the gap chapter for the MCP book in the series), the design rules vary by primitive type. The first three rules below apply to *tools* — they're the highest-stakes surface because the LLM picks them autonomously. The fourth and fifth cover prompts and completions.
 
 **1. One verb per tool, predictable shape.** `search` is one verb. `search-and-then-summarise` is two and an LLM will get the second one wrong. Decompose. Let the host LLM compose by calling several tools in sequence — or, better, capture that composition as a *prompt* (rule 4) so the user can trigger it directly.
 
@@ -678,7 +769,7 @@ Each of these is one more `@McpTool`-annotated method on a Spring `@Service`. Th
 
 - **[MCP](https://modelcontextprotocol.io) is the standard interface** between LLM clients (Claude, Copilot, Cursor, JetBrains AI) and external systems. It defines four primitives: typed *tools*, URI-addressable *resources*, parameterised *prompts*, and typeahead *completions*, all over JSON-RPC.
 - **Solr is a natural fit for MCP** because Solr operations (search, index, facet, list collections, get schema, modify schema) map cleanly to MCP tools and resources, and Solr is the thing that lets LLMs stop guessing and start retrieving.
-- The **[Apache Solr MCP Server](https://github.com/apache/solr-mcp)** is a Spring Boot application built on **[Spring AI MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html)** and **SolrJ**. Today it exposes 11 tools (search, indexing in JSON/CSV/XML, schema introspection and modification, collection management, health, stats), 2 resources (`solr://collections`, `solr://{collection}/schema`), 6 prompts (`explore-collections`, `setup-collection`, `view-schema`, `design-schema`, `index-data`, `search-collection`), and 5 `@McpComplete` typeahead handlers sharing one collection-listing data path.
+- The **[Apache Solr MCP Server](https://github.com/apache/solr-mcp)** is a Spring Boot application built on **[Spring AI MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html)** and **SolrJ**. Today it exposes 11 tools (search, indexing in JSON/CSV/XML, schema introspection and modification, collection management, health, stats), 2 resources (`solr://collections`, `solr://{collection}/schema`), 6 prompts (`explore-collections`, `setup-collection`, `view-schema`, `design-schema`, `index-data`, `search-collection`), and 5 `@McpComplete` typeaheads — one on the schema resource template and one each on the `collection` argument of the four collection-scoped prompts.
 - **The four `@Mcp…` annotations** — `@McpTool`, `@McpResource`, `@McpPrompt`, `@McpComplete` — are how Spring AI MCP makes you implement the four primitives. Tools are for the LLM to invoke; resources are for cheap grounding context; prompts let users trigger workflows as slash-commands; completions power typeahead pickers.
 - **STDIO mode needs no auth by design** — the client launches the server as a subprocess, so the OS process model is the trust boundary. The only STDIO-specific hazard is stdout hygiene (logs must go to stderr, banners must not exist), which is why images are built with [Jib](https://github.com/GoogleContainerTools/jib) rather than Buildpacks.
 - **HTTP mode is a network-exposed service** and needs the full web-security stack: OAuth2 with JWT validation (any OIDC provider — Auth0, Keycloak, Okta), input validation (local-param injection, field-name allowlisting, pagination bounds), and CORS locked to localhost by default. Authentication confirms *who*; validation confirms *what* — you need both.
