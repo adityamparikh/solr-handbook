@@ -16,13 +16,13 @@ Every example in this chapter assumes a Solr 10 server you can reach at `http://
 
 | Method | When to use | Command |
 |---|---|---|
-| **Docker** | You want a repeatable, isolated runtime — the default recommendation. | `docker run -p 8983:8983 apache/solr:10.0.0 solr-precreate shows` |
-| **Homebrew (macOS)** | You want Solr managed alongside your other dev tools. | `brew install solr && brew services start solr` |
-| **Archive** | You want to read the on-disk layout, edit `solr.in.sh`, or run on Linux without Docker. | Download from [solr.apache.org/downloads](https://solr.apache.org/downloads.html), then `bin/solr start -c` |
+| **Docker** | You want a repeatable, isolated runtime — the default recommendation. | `docker run -p 8983:8983 solr:10.0.0`, then `docker exec <container> solr create -c shows` |
+| **Homebrew (macOS)** | You want Solr managed alongside your other dev tools. | `brew install solr && brew services start solr` — note the brew service starts Solr in *standalone* mode (`--user-managed`), so the SolrCloud examples in this book need `bin/solr start` instead |
+| **Archive** | You want to read the on-disk layout, edit `solr.in.sh`, or run on Linux without Docker. | Download from [solr.apache.org/downloads](https://solr.apache.org/downloads.html), then `bin/solr start` (SolrCloud is the default in Solr 10) |
 
 : Three install paths for a local Solr 10 server — Docker, Homebrew, and the binary archive — and when each one fits. {#tbl-02-install-paths}
 
-The Docker image and the archive both default to `SOLR_HOME=/var/solr/data` (or the Linux equivalent). Homebrew uses `/opt/homebrew/var/lib/solr` on Apple Silicon. Know where it is — when an integration test misbehaves, the on-disk index is the source of truth.
+The Docker image defaults to `SOLR_HOME=/var/solr/data`; the tarball archive defaults to `server/solr` (the systemd service install uses `/var/solr/data`). Homebrew uses `/opt/homebrew/var/lib/solr` on Apple Silicon. Know where it is — when an integration test misbehaves, the on-disk index is the source of truth. (The Docker image's `solr-precreate` helper still exists, but it starts Solr in *standalone* mode — not what this book's SolrCloud examples assume.)
 
 ### Starting Solr
 
@@ -33,7 +33,7 @@ curl -s http://localhost:8983/solr/admin/info/system | jq .lucene.solr-spec-vers
 # → "10.0.0"
 ```
 
-If that doesn't return `10.0.0`, check `solr-8983-console.log` in the Solr home directory. For multi-node tests, the [Testcontainers pattern in §2.7](#integration-testing-with-testcontainers) is usually simpler than running multiple `bin/solr` processes by hand.
+If that doesn't return `10.0.0`, check `solr-8983-console.log` in the logs directory (`SOLR_LOGS_DIR` — `server/logs` for the archive, `/var/solr/logs` in Docker). For multi-node tests, the [Testcontainers pattern in §2.7](#integration-testing-with-testcontainers) is usually simpler than running multiple `bin/solr` processes by hand.
 
 ### A tour of the admin UI
 
@@ -60,7 +60,7 @@ The tabs you'll actually use:
 
   - **Documents** — Add a single document via JSON, XML, or CSV. Handy for one-off testing.
 
-> **Production tip — don't expose the admin UI to the public internet.** It's a development tool. In production, fence it off with a reverse proxy that requires authentication, or set `SOLR_OPTS="-Dsolr.disableAdminUI=true"` if you genuinely don't need it. The production observability stack lives in §4.13.
+> **Production tip — don't expose the admin UI to the public internet.** It's a development tool. In production, fence it off with a reverse proxy that requires authentication, or set `SOLR_OPTS="-Dsolr.ui.enabled=false"` if you genuinely don't need it. The production observability stack lives in §4.13.
 
 ## 2.1 What is a collection?
 
@@ -135,8 +135,10 @@ That command tells Solr: "create a collection called `shows`, use the `shows_con
 Equivalently from `bin/solr`:
 
 ```bash
-bin/solr create -c shows -d shows_config -s 2 -rf 2
+bin/solr create -c shows -d shows_config --shards 2 --replication-factor 2
 ```
+
+(Watch the short flags in Solr 10's CLI: `-s` is short for `--solr-url`, not shards.)
 
 For a single-node dev cluster, `numShards=1` and `numReplicas=1` is fine. Production starts at 1 shard × 3 replicas for fault tolerance, and grows from there based on data size and traffic.
 
@@ -242,9 +244,10 @@ This decision is the hardest one to reverse cheaply. Changing field types or ana
   </fieldType>
 
   <!-- Dense vector field for semantic search (384-dim sentence embeddings) -->
+  <!-- hnswM / hnswEfConstruction were named hnswMaxConnections / hnswBeamWidth in Solr 9.x -->
   <fieldType name="knn_vector_384" class="solr.DenseVectorField"
              vectorDimension="384" similarityFunction="cosine"
-             knnAlgorithm="hnsw" hnswMaxConnections="16" hnswBeamWidth="100"/>
+             knnAlgorithm="hnsw" hnswM="16" hnswEfConstruction="100"/>
 
   <!-- ===== Fields ===== -->
 
@@ -458,21 +461,22 @@ For Solr 10, the Maven coordinates are:
 </dependency>
 ```
 
-The Solr 10 reference guide states verbatim: *"If you want to use Jetty-based HTTP clients (HttpJettySolrClient, ConcurrentUpdateJettySolrClient, LBJettySolrClient, or CloudJettySolrClient), you need to add the maven dependency solr-solrj-jetty."* Alternatively, *"you can use HttpJdkSolrClient from the base solr-solrj artifact, which uses Java's built-in HTTP client and has no additional dependencies."* The split into multiple artifacts is the result of SOLR-17161 in the 9.x line; further artifacts include `solr-solrj-zookeeper` (only needed if you really must speak ZooKeeper from the client) and `solr-solrj-streaming` (Streaming Expressions).
+The Solr 10 reference guide states verbatim: *"If you want to use Jetty-based HTTP clients (HttpJettySolrClient, ConcurrentUpdateJettySolrClient, LBJettySolrClient, or CloudJettySolrClient), you need to add the maven dependency solr-solrj-jetty."* Alternatively, *"you can use HttpJdkSolrClient from the base solr-solrj artifact, which uses Java's built-in HTTP client and has no additional dependencies."* The Jetty split is the result of SOLR-17161, which landed in Solr 10.0; further artifacts include `solr-solrj-zookeeper` (only needed if you really must speak ZooKeeper from the client) and `solr-solrj-streaming` (Streaming Expressions).
 
-> **Solr 9 difference — single SolrJ artifact.** In Solr 9.x (before SOLR-17161 landed late in the cycle), there was a single `solr-solrj` artifact that pulled in Jetty, ZooKeeper, and streaming transitively. If you're upgrading a 9.x build script, expect to add `solr-solrj-jetty` (or switch to `HttpJdkSolrClient`) and possibly `solr-solrj-zookeeper`.
+> **Solr 9 difference — SolrJ packaging.** In Solr 9.x the Jetty clients lived inside `solr-solrj` itself, and the separate `solr-solrj-zookeeper`/`-streaming` modules came in transitively. Solr 10 moved the Jetty clients into `solr-solrj-jetty` (SOLR-17161) and made the other modules opt-in from a Maven-POM perspective (SOLR-15730). If you're upgrading a 9.x build script, expect to add `solr-solrj-jetty` (or switch to `HttpJdkSolrClient`) and possibly `solr-solrj-zookeeper`.
 
-> **Production tip — Solr 10 SolrJ runs on Java 17.** The *server* requires Java 21 (per the Solr 10 upgrade notes: *"Solr 10.0 requires at least Java 21, while SolrJ 10.0 requires at least Java 17"*), but the *client* library only requires Java 17. Java 17 client applications can still talk to a Solr 10 cluster.
+> **Production tip — Solr 10 SolrJ runs on Java 17.** Per the Solr 10 upgrade notes, the minimum Java version for the Solr 10 *server* is Java 21, while the minimum for *SolrJ* 10 is Java 17. Java 17 client applications can still talk to a Solr 10 cluster.
 
 ### Connecting to SolrCloud
 
-In Solr 10, the recommended pattern is to connect via Solr node URLs, not directly to ZooKeeper. The Solr 9.x line deprecated `CloudSolrClient.Builder`'s ZooKeeper-hosts constructor; the 10.x guidance is to give the client a list of Solr base URLs.
+In Solr 10, the recommended pattern is to connect via Solr node URLs, not directly to ZooKeeper. Solr 10.0 deprecated `CloudSolrClient.Builder`'s ZooKeeper-hosts constructor (SOLR-14070); the guidance is to give the client a list of Solr base URLs.
 
 ```java
-import org.apache.solr.client.solrj.impl.CloudSolrClient;
 import org.apache.solr.client.solrj.SolrClient;
-import java.time.Duration;
+import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.client.solrj.impl.HttpJdkSolrClient;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 public class SolrFactory {
     public static SolrClient build() {
@@ -481,10 +485,13 @@ public class SolrFactory {
             "http://solr-1.solr-headless.solr.svc.cluster.local:8983/solr",
             "http://solr-2.solr-headless.solr.svc.cluster.local:8983/solr"
         );
+        // Timeouts live on the internal HTTP client's builder, not on
+        // CloudSolrClient.Builder itself.
         return new CloudSolrClient.Builder(solrUrls)
             .withDefaultCollection("shows")
-            .withConnectionTimeout(Duration.ofSeconds(10))
-            .withRequestTimeout(Duration.ofSeconds(30))
+            .withInternalClientBuilder(new HttpJdkSolrClient.Builder()
+                .withConnectionTimeout(10, TimeUnit.SECONDS)
+                .withRequestTimeout(30, TimeUnit.SECONDS))
             .build();
     }
 }
@@ -492,7 +499,7 @@ public class SolrFactory {
 
 Hold the client as a long-lived singleton in your application — it's thread-safe and expensive to construct. Close it on shutdown.
 
-> **Solr 9 difference — ZooKeeper host constructor.** In Solr 9.x, `new CloudSolrClient.Builder(zkHosts, Optional.of(chroot))` was the common idiom: the client connected directly to ZooKeeper. That constructor was deprecated in 9.x and the Solr 10 recommendation is to pass Solr base URLs as shown above (the client discovers the cluster via the Solr nodes themselves). If you absolutely must speak ZK from the client, add `solr-solrj-zookeeper` and use the ZK-host constructor — but the URL-list form is the future and is what works in production without the extra dependency.
+> **Solr 9 difference — ZooKeeper host constructor.** In Solr 9.x, `new CloudSolrClient.Builder(zkHosts, Optional.of(chroot))` was the common idiom: the client connected directly to ZooKeeper. That constructor was deprecated in Solr 10.0 (SOLR-14070, with removal unlikely before Solr 11) and the recommendation is to pass Solr base URLs as shown above (the client discovers the cluster via the Solr nodes themselves). If you absolutely must speak ZK from the client, add `solr-solrj-zookeeper` and use the ZK-host constructor — but the URL-list form is the future and is what works in production without the extra dependency.
 >
 > Also in Solr 10, the `Major Changes` page notes: *"CloudHttp2SolrClient.Builder has moved to CloudSolrClient; users should generally have no need to refer to CloudHttp2SolrClient or any class/member with 'http2' in it. The builder will check if Jetty HttpClient is available and use that, otherwise fallback on a JDK based HttpClient."* For new code in Solr 10, prefer `CloudSolrClient.Builder` directly. The `CloudHttp2SolrClient` symbol still exists for source compatibility but is effectively an alias.
 
@@ -535,14 +542,20 @@ For real ingestion pipelines do **not** call `client.add(doc)` in a loop per doc
 2. **`ConcurrentUpdateJettySolrClient`** (Solr 10) — fire-and-forget with internal queues and parallel HTTP. Highest throughput; you must implement an error handler because exceptions surface asynchronously.
 
 ```java
-import org.apache.solr.client.solrj.impl.ConcurrentUpdateJettySolrClient;
+import org.apache.solr.client.solrj.jetty.ConcurrentUpdateJettySolrClient;
+import org.apache.solr.client.solrj.jetty.HttpJettySolrClient;
 
-try (ConcurrentUpdateJettySolrClient client =
-        new ConcurrentUpdateJettySolrClient.Builder(
-                "http://solr-0:8983/solr/shows")
-            .withQueueSize(10_000)
-            .withThreadCount(8)
-            .build()) {
+// The Jetty clients live in the org.apache.solr.client.solrj.jetty package
+// (solr-solrj-jetty module), and the builder takes the HTTP client to send
+// through; `true` closes that client when the concurrent client closes.
+ConcurrentUpdateJettySolrClient.Builder builder =
+    new ConcurrentUpdateJettySolrClient.Builder(
+            "http://solr-0:8983/solr/shows",
+            new HttpJettySolrClient.Builder().build(),
+            true);
+builder.withQueueSize(10_000).withThreadCount(8);
+
+try (ConcurrentUpdateJettySolrClient client = builder.build()) {
 
     List<SolrInputDocument> batch = new ArrayList<>(1_000);
     for (Show s : shows) {
@@ -561,7 +574,7 @@ try (ConcurrentUpdateJettySolrClient client =
 
 For the typical case (a Java service indexing through SolrCloud) prefer `CloudSolrClient` batches — it routes documents to the correct shard leader directly, avoiding the inter-node hop that `ConcurrentUpdateJettySolrClient` against a single endpoint introduces.
 
-> **Production tip — set `withQueueSize` deliberately.** Too small and threads stall on the bounded queue. Too large and a node failure leaves thousands of in-flight docs to recover. 5k–20k is a typical sweet spot. Monitor with the Solr metrics endpoint (`UPDATE.updateHandler.adds`).
+> **Production tip — set `withQueueSize` deliberately.** Too small and threads stall on the bounded queue. Too large and a node failure leaves thousands of in-flight docs to recover. 5k–20k is a typical sweet spot. Monitor update-handler add rates via `/admin/metrics` (OpenTelemetry/Prometheus snake_case naming in Solr 10; the Dropwizard-era key was `UPDATE.updateHandler.adds`).
 
 ### Atomic and partial updates: a teaser
 
@@ -571,15 +584,15 @@ SolrJ also supports **atomic updates** — modify a single field without resendi
 
 ### What it is
 
-[Testcontainers](https://testcontainers.com) is a Java library that spins up real Docker containers inside your JUnit or TestNG tests and tears them down automatically when the test suite finishes. The `solr` module provides a `SolrContainer` that starts the official `apache/solr` Docker image, exposes the Solr port, and gives you a ready-to-use `SolrClient` — the same client you use in production.
+[Testcontainers](https://testcontainers.com) is a Java library that spins up real Docker containers inside your JUnit or TestNG tests and tears them down automatically when the test suite finishes. The `solr` module provides a `SolrContainer` that starts the official `solr` Docker image, exposes the Solr port, and lets you connect with the same `SolrClient` you use in production.
 
-> **Why not an embedded Solr?** There is no supported embedded Solr in Solr 10. The old `EmbeddedSolrServer` still compiles but is undocumented, untested for correctness, and missing SolrCloud semantics. The Solr project's own recommendation is to test against a real Solr instance. Testcontainers is how you do that without a shared dev cluster.
+> **Why not an embedded Solr?** There is no supported embedded Solr in Solr 10. The old `EmbeddedSolrServer` still exists (Solr's own test framework uses it), but it is not documented in the reference guide, is not a supported deployment mode, and lacks SolrCloud semantics. Testing against a real Solr is the dependable path, and Testcontainers is how you do that without a shared dev cluster.
 
 ### The official Docker image
 
-The official image is [`apache/solr`](https://hub.docker.com/r/apache/solr) on Docker Hub. Tags follow Solr releases: `apache/solr:10.0.0`, `apache/solr:9.8`, `apache/solr:latest`. The Solr Admin UI is available on port 8983 — useful for poking at a running container while debugging a test.
+The official image is the Docker Official Image [`solr`](https://hub.docker.com/_/solr) on Docker Hub (there is no `apache/solr` repository). Tags follow Solr releases: `solr:10.0.0`, `solr:9.9`, `solr:latest`, plus `-slim` variants. The Solr Admin UI is available on port 8983 — useful for poking at a running container while debugging a test.
 
-> **Admin UI for debugging.** When a test is failing and you want to inspect the index, add a `Thread.sleep(300_000)` breakpoint, connect to `http://localhost:<mappedPort>/solr`, and use the **Analysis** tab (to trace how a string is tokenized), the **Query** tab (to run ad-hoc queries), and the **Schema** tab (to inspect field definitions). It's the fastest way to diagnose analyzer chain or schema issues without writing more test code. See the [Solr Admin UI reference](https://solr.apache.org/guide/solr/latest/deployment-guide/solr-admin-ui.html) for the full tour.
+> **Admin UI for debugging.** When a test is failing and you want to inspect the index, add a `Thread.sleep(300_000)` breakpoint, connect to `http://localhost:<mappedPort>/solr`, and use the **Analysis** tab (to trace how a string is tokenized), the **Query** tab (to run ad-hoc queries), and the **Schema** tab (to inspect field definitions). It's the fastest way to diagnose analyzer chain or schema issues without writing more test code. See the [Solr Admin UI reference](https://solr.apache.org/guide/solr/latest/getting-started/solr-admin-ui.html) for the full tour.
 
 ### Maven dependency
 
@@ -587,24 +600,25 @@ The official image is [`apache/solr`](https://hub.docker.com/r/apache/solr) on D
 <dependency>
   <groupId>org.testcontainers</groupId>
   <artifactId>solr</artifactId>
-  <version>1.20.4</version>
+  <version>1.21.4</version>
   <scope>test</scope>
 </dependency>
 <!-- JUnit 5 integration -->
 <dependency>
   <groupId>org.testcontainers</groupId>
   <artifactId>junit-jupiter</artifactId>
-  <version>1.20.4</version>
+  <version>1.21.4</version>
   <scope>test</scope>
 </dependency>
 ```
+
+(Testcontainers 2.x renames the artifact to `testcontainers-solr` and moves the class to the `org.testcontainers.solr` package; this book pins the last 1.x line, which is what the Solr module currently ships on.)
 
 ### A minimal integration test
 
 ```java
 import org.apache.solr.client.solrj.SolrClient;
-import org.apache.solr.client.solrj.impl.CloudSolrClient;
-import org.apache.solr.client.solrj.request.CollectionAdminRequest;
+import org.apache.solr.client.solrj.jetty.HttpJettySolrClient;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.client.solrj.request.SolrQuery;
 import org.apache.solr.common.SolrInputDocument;
@@ -614,23 +628,21 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
-import java.util.List;
-
 @Testcontainers
 class ProductIndexTest {
 
     @Container
     static SolrContainer solr = new SolrContainer(
-            DockerImageName.parse("apache/solr:10.0.0"))
+            DockerImageName.parse("solr:10.0.0"))
         .withCollection("shows");    // creates the collection on startup
 
     private SolrClient client;
 
     @BeforeEach
-    void setUp() throws Exception {
+    void setUp() {
         // SolrContainer exposes the standard Solr port on a random host port
         String url = "http://" + solr.getHost() + ":" + solr.getSolrPort() + "/solr";
-        client = new CloudSolrClient.Builder(List.of(url))
+        client = new HttpJettySolrClient.Builder(url)
             .withDefaultCollection("shows")
             .build();
     }
@@ -665,13 +677,14 @@ class ProductIndexTest {
 A few things worth noting:
 
 - **`@Container` + `static`** — a static container is shared across all tests in the class and started once. Drop `static` if you need a clean Solr per test (slower but fully isolated).
-- **`withCollection("shows")`** — creates a collection using Solr's default configset. To use a custom configset, mount it into the container with `.withSolrConfiguration("configsetName", path)` — see the [Testcontainers Solr docs](https://java.testcontainers.org/modules/solr/).
+- **Use a base-URL HTTP client, not `CloudSolrClient`.** The container runs SolrCloud (embedded ZooKeeper) and registers its node as `localhost:8983_solr` — the *container-internal* address. A `CloudSolrClient` would fetch cluster state and route requests to that unreachable address. An `HttpJettySolrClient` (or `HttpJdkSolrClient`) pointed at the mapped port works for everything, including the Collections and Schema APIs. In production — where nodes advertise reachable addresses — `CloudSolrClient` is the right default.
+- **`withCollection("shows")`** — creates a collection using Solr's default configset. To use a custom configset, upload one with `.withConfiguration("shows_config", getClass().getResource("/solrconfig.xml"))` plus optional `.withSchema(...)` — see the [Testcontainers Solr docs](https://java.testcontainers.org/modules/solr/).
 - **`getSolrPort()`** returns the *mapped* host port, which is random. Testcontainers handles the Docker port mapping; you never hardcode 8983 in tests.
 - **Commit is required.** The container runs with the same commit defaults as a real Solr. Either call `client.commit()` explicitly after indexing in tests, or configure the container's `solrconfig.xml` with a short `autoSoftCommit` interval.
 
 > **Production tip — one container per test class, shared.** Container startup is the expensive part (3–8 seconds for Solr). Use `@Container static` and `@TestMethodOrder` to keep the container alive across all tests. If test isolation requires a clean index, call `client.deleteByQuery("shows", "*:*")` + `client.commit()` in `@BeforeEach` rather than restarting the container.
 
-> **Production tip — pin the image version.** `apache/solr:latest` will silently pull a newer Solr on the next `docker pull`, which can break tests when APIs change. Pin to `apache/solr:10.0.0` (or whatever minor you're targeting) in CI, and update deliberately.
+> **Production tip — pin the image version.** `solr:latest` will silently pull a newer Solr on the next `docker pull`, which can break tests when APIs change. Pin to `solr:10.0.0` (or whatever minor you're targeting) in CI, and update deliberately.
 
 ## 2.8 Partial updates: atomic, in-place, and when they fall back
 
@@ -808,7 +821,7 @@ Solr decides at request time, per field. **All** of the following must hold:
 
 If *any* of those is violated, Solr **silently falls back** to a regular atomic update — same response, very different cost. That silent fallback is the trap.
 
-> **Production tip — fail fast with `update.partial.requireInPlace=true`.** Solr 10 lets you set this request parameter; if the update can't be done in-place the request fails instead of silently falling back. Use this on hot counter paths in your CI tests — the day someone "helpfully" adds `stored="true"` to your counter field, the build breaks instead of production performance.
+> **Production tip — fail fast with `update.partial.requireInPlace=true`.** Since Solr 9 you can set this request parameter; if the update can't be done in-place the request fails instead of silently falling back. Use this on hot counter paths in your CI tests — the day someone "helpfully" adds `stored="true"` to your counter field, the build breaks instead of production performance.
 
 #### Schema pattern for counters
 
@@ -832,7 +845,7 @@ public void bumpViewCount(SolrClient client, String docId) throws Exception {
 
     UpdateRequest req = new UpdateRequest();
     req.add(doc);
-    req.setParam("update.partial.requireInPlace", "true"); // Solr 10: fail fast
+    req.setParam("update.partial.requireInPlace", "true"); // fail fast (Solr 9+)
     req.process(client, "shows");
 }
 ```
@@ -915,7 +928,7 @@ These three levers — `-1`, `1`, `N` — cover most "create vs update vs replac
 
 Nested documents are supported by partial updates, with two rules:
 
-1. **The schema needs `_root_`** as an indexed field (Solr auto-populates it with the root document's ID). For partial updates to children, `_root_` must also be `stored="true"` or `docValues="true"`.
+1. **The schema needs `_root_`** as an indexed field (Solr auto-populates it with the root document's ID). The usual atomic-update storage requirements (§2.8.1) apply to your real fields.
 2. **The update document must include `_root_` set to the parent's ID.** Without it, Solr treats the child ID as a root ID and may overwrite an unrelated root document.
 
 ```java
@@ -931,7 +944,7 @@ req.add(child);
 req.process(client, "shows");
 ```
 
-Caveats: in-place updates do *not* work on child documents (they go through the atomic path, which conceptually rewrites the entire tree). And delete-by-id only works on root documents — to delete a child, use delete-by-query or an atomic remove on the parent's children pseudo-field.
+Caveats: an *atomic* update on a child document reindexes the entire tree from the root — expect that overhead; an *in-place* update (an eligible numeric docValues-only field, per §2.8.2) is exactly how you avoid it. And delete-by-id only works on root documents — to delete a child, use delete-by-query or an atomic remove on the parent's children pseudo-field.
 
 ## 2.9 Reindexing: when, why, and how
 
@@ -1060,7 +1073,7 @@ public void blueGreenReindex(SolrClient client) throws Exception {
 
 #### `REINDEXCOLLECTION` — the built-in option
 
-Solr ships a `REINDEXCOLLECTION` command that does steps 1, 2, and the alias swap from the server side:
+Solr ships a `REINDEXCOLLECTION` command that does steps 1 and 2 from the server side:
 
 ```java
 CollectionAdminRequest.reindexCollection("shows_v1")
@@ -1070,7 +1083,7 @@ CollectionAdminRequest.reindexCollection("shows_v1")
     .process(client);
 ```
 
-It creates a temporary collection with the new schema, copies the source documents via their **stored fields**, runs them through the new analyzer chain, and aliases the original name to the new collection. The Javadoc carries an unambiguous warning: *"Reindexing is potentially a lossy operation — some indexed data that is not available as stored fields may be irretrievably lost."*
+It creates the target collection with the new schema, copies the source documents via their **stored fields**, and runs them through the new analyzer chain. The alias behavior depends on the target: only when the target name is the *same as the source* (or omitted) does Solr generate a sequentially-named target and alias the original name to it; with an explicit `.setTarget("shows_v2")` as above, **no alias is created** — the CREATEALIAS swap remains your step. The Javadoc carries an unambiguous warning: *"Reindexing is potentially a lossy operation — some indexed data that is not available as stored fields may be irretrievably lost."*
 
 In production we recommend reindexing **from the system of record** whenever possible:
 
@@ -1089,7 +1102,7 @@ The pattern: read the source with `cursorMark`, optionally transform, batch-writ
 ```java
 import java.util.*;
 import java.util.concurrent.*;
-import org.apache.solr.client.solrj.SolrQuery;
+import org.apache.solr.client.solrj.request.SolrQuery;   // moved to .request in SolrJ 10
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.SolrInputDocument;
@@ -1246,8 +1259,8 @@ A manual `optimize` (or `commit(optimize=true)`) forces all segments into one (o
 - Schemas are explicit contracts. Use managed-schema, disable schemaless in production, and choose `indexed/stored/docValues/multiValued` deliberately per field.
 - The text analysis chain (`Tokenizer + Filters`) is the most important relevance lever you have; keep index/query symmetric except for query-time synonym expansion.
 - Use `CloudSolrClient` for connections; batch with `add(Collection)` or use `ConcurrentUpdateJettySolrClient` for fire-and-forget throughput.
-- **Test against a real Solr.** Use `SolrContainer` from Testcontainers with `apache/solr:10.0.0`. One `static` container per test class; clean the index in `@BeforeEach` rather than restarting.
-- Partial updates come in three flavors: **full replace** (default), **atomic** (server-side modifier maps — still a full reindex underneath), and **in-place** (genuine docValues-only update for single-valued numeric fields). Use `update.partial.requireInPlace=true` in Solr 10 to fail fast when an in-place update would silently fall back to atomic.
+- **Test against a real Solr.** Use `SolrContainer` from Testcontainers with the official `solr:10.0.0` image and a base-URL HTTP client. One `static` container per test class; clean the index in `@BeforeEach` rather than restarting.
+- Partial updates come in three flavors: **full replace** (default), **atomic** (server-side modifier maps — still a full reindex underneath), and **in-place** (genuine docValues-only update for single-valued numeric fields). Use `update.partial.requireInPlace=true` (Solr 9+) to fail fast when an in-place update would silently fall back to atomic.
 - Optimistic concurrency via `_version_` (`-1` = must not exist, `1` = must exist, `N` = exact match) composes freely with all three update flavors.
 - Reindex when index-time analysis, field types, codec, `luceneMatchVersion`, or `copyField` declarations change. Skip reindexing for query-time-only changes (synonyms!), new untouched fields, and `solrconfig.xml` knobs that don't affect storage.
 - Production reindexing is **blue/green with collection aliases**: build into a new collection, validate, atomically swap the alias, keep the old around for rollback. Read from your system of record when possible; `REINDEXCOLLECTION` is convenient but lossy for non-stored fields.

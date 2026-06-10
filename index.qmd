@@ -2,7 +2,7 @@
 
 This handbook is a current, opinionated, code-first walkthrough of Apache Solr 10 — its internals, indexing pipeline, query layer, distributed runtime (SolrCloud), the Model Context Protocol integration, and the broader search-engine landscape it lives in. Every chapter mixes theory with concrete XML, JSON, and SolrJ Java snippets you can run. Diagrams are written in [Mermaid](https://mermaid.js.org/) and live as text in the source repository.
 
-The book covers Apache Solr 10.0.0 (released 2025) and explicitly calls out differences from Solr 9.x where they affect upgrades. Concepts that have been stable for multiple major versions are presented without version drift; concepts that changed recently are tagged with the JIRA ticket and release in which they landed.
+The book covers Apache Solr 10.0.0 (released March 2026) and explicitly calls out differences from Solr 9.x where they affect upgrades. Concepts that have been stable for multiple major versions are presented without version drift; concepts that changed recently are tagged with the JIRA ticket and release in which they landed.
 
 ## Who this book is for
 
@@ -31,6 +31,19 @@ Chapters 1–4 build on each other and are best read in order. Chapters 5–7 st
 - **[Chapter 7 — Alternatives](chapters/07-alternatives.qmd)** compares Solr to Elasticsearch and OpenSearch in 2026 — licensing history, architecture, API surface, performance reality, migration considerations, and the MCP servers offered by all three engines (§7.9).
 
 Each chapter opens with a callout box listing its prerequisites and what you will learn. For a single topic, use the [Index](back-matter/book-index.qmd).
+
+## Companion code
+
+Every load-bearing example in this book exists as **runnable, tested Java code** in the [`code/` directory of the book's repository](https://github.com/adityamparikh/solr-handbook/tree/main/code): a Gradle project targeting Solr 10.0.0 and SolrJ 10.0.0 on Java 21. It contains the 30-show seed catalog from §2.3, the schema built via the Schema API, the indexing/partial-update/reindex patterns from Chapter 2, the eDisMax/facet/vector/RRF code from Chapter 3, and the NDCG and signals-boosting implementations from Chapter 5.
+
+```bash
+git clone https://github.com/adityamparikh/solr-handbook.git
+cd solr-handbook/code
+./gradlew build              # compile + unit tests (no Docker needed)
+./gradlew integrationTest    # Testcontainers tests against a real solr:10.0.0
+```
+
+The unit tests double as fact-checks — `RrfTest` reproduces the §3.6 worked RRF table digit for digit and `NdcgTest` verifies the §5.1 formula — and the integration tests drive every Chapter 2–3 example against a real Solr 10 in Docker. CI runs both suites on every change.
 
 ## Conventions
 
@@ -75,8 +88,8 @@ This work is licensed under the [Creative Commons Attribution 4.0 International 
 
 Apache®, Apache Solr™, Apache Lucene™, and Apache ZooKeeper™ are trademarks of the [Apache Software Foundation](https://www.apache.org/). Elasticsearch is a trademark of Elasticsearch B.V. OpenSearch is a trademark of the OpenSearch Software Foundation. All other trademarks are property of their respective owners. Use of trademarks in this book is descriptive only and does not imply endorsement.
 
-- **Code repository:** <https://github.com/adityamparikh/solr-handbook-code> *(planned for v1.0 release)*
-- **Errata and discussion:** <https://github.com/adityamparikh/solr-handbook-code/issues>
+- **Companion code:** <https://github.com/adityamparikh/solr-handbook/tree/main/code>
+- **Errata and discussion:** <https://github.com/adityamparikh/solr-handbook/issues>
 - **Author contact:** aditya.m.parikh@gmail.com
 
 ISBN: not yet assigned (pre-print edition).

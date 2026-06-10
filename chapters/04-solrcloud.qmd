@@ -18,7 +18,7 @@ Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powe
 > - **Java requirement.** Solr 10 server needs **Java 21**. Solr 9.x ran on Java 11+. (SolrJ on the client side still only needs Java 17 in 10.x.)
 > - **`bin/solr start` default.** In Solr 9, the default was standalone mode, and SolrCloud required `-c`. In Solr 10, the default is SolrCloud, and standalone requires `--user-managed`. Scripts written against 9 may need updating either way.
 > - **HTTP layer.** Jetty 12 (was 10) and Jakarta EE 10 (was `javax`). If you write custom plugins that touched servlet APIs, expect package renames (`javax.servlet.*` → `jakarta.servlet.*`).
-> - **Metrics.** Dropwizard → OpenTelemetry. Metric names changed from dot-delimited (`SEARCH.requestTimes.p95`) to snake_case (`search_request_times_p95`). Existing Prometheus dashboards will break.
+> - **Metrics.** Dropwizard → OpenTelemetry. Metric names changed from Dropwizard's dot-delimited style (e.g. `QUERY./select.requestTimes` with its percentile attributes) to snake_case OpenTelemetry names. Existing Prometheus dashboards will break.
 > - **`bin/solr delete`** no longer deletes a configset when you delete a collection — you must now explicitly pass `--delete-config`. In 9, a configset used by only one collection was deleted automatically.
 > - **Removed modules.** `jaegertracer-configurator`, `analytics`, `hadoop-auth`. If you used any of these, you need a replacement.
 
@@ -63,7 +63,7 @@ Solr is otherwise stateless: a node restart rebuilds its in-memory view from Zoo
 
 ### Solr 10's optional Overseer-less mode
 
-The Solr 10 release notes describe SOLR-17877: *"The SolrCloud Overseer is disable-able, in lieu of a simpler distributed mode of cluster command and collection state processing."* You enable it with the `overseerEnabled` cluster property or the `SOLR_CLOUD_OVERSEER_ENABLED` env var. *"In Solr 11, the Overseer might cease to exist, in an effort to simplify SolrCloud and maintenance."* For new deployments on Solr 10, **stay with the Overseer for now** — distributed mode is fine but the migration path is one-way.
+The Solr 10 release notes describe SOLR-17877: *"The SolrCloud Overseer is disable-able, in lieu of a simpler distributed mode of cluster command and collection state processing."* You enable it with the `overseerEnabled` cluster property or the `SOLR_CLOUD_OVERSEER_ENABLED` env var. The release notes suggest the Overseer may be removed entirely in a future major release as part of simplifying SolrCloud. For new deployments on Solr 10, **stay with the Overseer for now** — distributed mode is fine but the migration path is one-way.
 
 ## 4.3 Collections, shards, replicas
 
@@ -110,13 +110,13 @@ Common production layouts:
 
 - **All-NRT (3 replicas/shard).** Simplest. Use when soft-commit visibility latency matters.
 - **TLOG leaders + PULL followers (1 TLOG + N PULL per shard).** Best for write-heavy, read-very-heavy workloads where seconds-of-staleness on followers is OK.
-- **NRT + PULL.** NRT for leader/indexing, PULL for additional query capacity. *Caveat from the Solr user list:* mixing NRT and PULL/TLOG can trigger full-index recoveries on PULL when an NRT leader changes, because NRT replicas of the same shard have differently-named segment files. Prefer pure TLOG+PULL or pure NRT layouts.
+- **NRT + PULL.** NRT for leader/indexing, PULL for additional query capacity. The reference guide's "combining replica types" guidance recommends exactly three layouts — all-NRT, all-TLOG, or TLOG+PULL — and cautions against mixing NRT with the replication-based types: when an NRT leader changes, the new leader's locally-built segments differ from what followers replicated, which can force expensive full-index recoveries. Prefer pure TLOG+PULL or pure NRT layouts.
 
 ## 4.5 Document routing
 
 Solr 10 supports two routers:
 
-- **`compositeId`** (default) — `murmur3(id) % shardCount` decides the shard. Prefix routing (`tenant1!doc-42`) lets you co-locate a tenant on a known shard.
+- **`compositeId`** (default) — a MurmurHash3 of the id is mapped onto per-shard **hash ranges**: each shard owns a slice of the 32-bit hash space, and the document goes to the shard whose range contains its hash. (Ranges, not modulo — that's what makes SPLITSHARD's range-splitting and prefix routing possible.) Prefix routing (`tenant1!doc-42`) hashes the prefix into the upper bits, co-locating a tenant on a known shard.
 - **`implicit`** — you specify the shard at index time. You're on your own for routing logic. Useful when each shard represents a time bucket or a tenant.
 
 > **Production tip — pick a router up front and never change it.** Switching routers requires a full reindex into a new collection.
@@ -136,8 +136,8 @@ sequenceDiagram
     N1--xZK: Node A crashes, session expires
     ZK-->>N2: watch fires
     ZK-->>N3: watch fires
-    N2->>ZK: attempt CAS on /leader_elect
-    N3->>ZK: attempt CAS on /leader_elect
+    N2->>ZK: create sequential ephemeral znode<br/>under /collections/shows/leader_elect/shard1/election
+    N3->>ZK: create sequential ephemeral znode<br/>under /collections/shows/leader_elect/shard1/election
     ZK-->>N2: you are next in line
     N2->>N3: peer sync - compare tlog versions
     N3-->>N2: tlog hash and version
@@ -263,10 +263,10 @@ In Solr 9.0 the entire autoscaling framework was removed (SOLR-14656): *"Autosca
 What replaces it in Solr 9+ and continues into Solr 10:
 
 1. **Replica Placement Plugins.** A pluggable API for *where to put a replica* on collection create / replica add. Stock implementations:
-   - `AffinityPlacementFactory` — respects availability zones, replica types, disk usage. The default for production. As of Solr 9.1, default `minimalFreeDiskGB` is 20.
+   - `AffinityPlacementFactory` — respects availability zones, replica types, disk usage. The recommended choice for production (Solr's out-of-the-box default when no plugin is configured is the simpler `SimplePlacementFactory`). The default `minimalFreeDiskGB` is 5, lowered from the original 20 in Solr 9.7 (SOLR-16915); the example below raises it back to 20.
    - `MinimizeCoresPlacementFactory` — pure load balancing.
    - `RandomPlacementFactory` — testing.
-2. **Node Roles.** A node can have role `overseer`, `data`, or both — letting you dedicate nodes to coordination vs. indexing/serving.
+2. **Node Roles.** A node can have role `overseer`, `data`, and/or (since Solr 9.3) `coordinator` — letting you dedicate nodes to cluster coordination, indexing/serving, or distributed-query aggregation.
 3. **External orchestration.** True auto-scaling (adding/removing nodes in response to load) is now an *operational* concern, not a Solr-internal one. On Kubernetes the Solr Operator (§4.12) plus HPA handles this. On VMs you script it.
 
 Configure `AffinityPlacementFactory` once per cluster:

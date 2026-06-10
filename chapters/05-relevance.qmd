@@ -158,7 +158,7 @@ update(shows_signals_aggr, batchSize="500",
       count(*)),
     query_s, doc_id,
     count(*) as count_i,
-    concat(fields="query_s,doc_id", delim="|") as id))
+    concat(fields="query_s,doc_id", delim="|", as="id")))
 ```
 
 **Pass 2 — enrich with `weight_d` as an in-place update.** Apply your dampening function. The cleanest approach is to compute the weight in your application code and issue per-row in-place updates against `_signals_aggr`. Because `weight_d` is `indexed=false stored=false docValues=true`, this is a true in-place update (§2.8.2) — no reindex, no analyzer chain, microseconds per row:
@@ -222,7 +222,10 @@ String boostExpr = aggr.getResults().stream()
     .map(d -> String.format("if(termfreq(id,'%s'),%.3f,0)",
             d.get("doc_id"),
             ((Number) d.get("weight_d")).doubleValue()))
-    .collect(Collectors.joining(",", "sum(", ")"));
+    .collect(Collectors.joining(",", "sum(1,", ")"));
+// The leading 1 is load-bearing: `boost` is MULTIPLICATIVE, so without it every
+// document that has no signal would have its BM25 score multiplied by zero.
+// With it, unsignaled docs keep their score and signaled docs scale by (1 + weight).
 
 SolrQuery q = new SolrQuery(userQuery)
     .setRequestHandler("/select");
@@ -241,9 +244,11 @@ For small `_signals_aggr` collections, you can skip the API-layer lookup and joi
 ```java
 q.set("bq",
   "{!join from=doc_id to=id fromIndex=shows_signals_aggr score=max}" +
-  "query_s:\"" + ClientUtils.escapeQueryChars(userQuery.toLowerCase()) + "\"" +
-  "^{!func}weight_d");
+  "{!boost b=weight_d v='query_s:\"" +
+  ClientUtils.escapeQueryChars(userQuery.toLowerCase()) + "\"'}");
 ```
+
+The `{!boost b=weight_d}` wrapper multiplies each matching signal row's score by its `weight_d` before the join propagates the max — the standard parser's `^` only accepts a numeric boost factor, so `^{!func}…` would be a syntax error.
 
 This works but doesn't scale past a few million signal docs. Stick with the API-layer pattern for production.
 
@@ -259,7 +264,7 @@ The operational rule of thumb: **if your aggregation cadence is faster than your
 
 ## 5.4 Learning to Rank with Solr's `ltr` module
 
-The `ltr` module ships with Solr; enable with `-Dsolr.modules=ltr -Dsolr.ltr.enabled=true`. It runs a machine-learned reranker against the top *N* documents from your BM25/hybrid retrieve. There are three moving parts:
+The `ltr` module ships with Solr; enable it with `-Dsolr.modules=ltr` (or `SOLR_MODULES=ltr` in `solr.in.sh`). The `-Dsolr.ltr.enabled=true` flag you'll see in tutorials is only a toggle used by the bundled techproducts example configset, not a general LTR switch. It runs a machine-learned reranker against the top *N* documents from your BM25/hybrid retrieve. There are three moving parts:
 
 - A **feature store** (managed JSON describing features — Solr queries, field values, external inputs).
 - A **model store** (managed JSON containing the trained model — typically `LinearModel` or `MultipleAdditiveTreesModel`).
@@ -273,19 +278,21 @@ BM25 is one signal. LTR lets you combine 30+ signals — text similarity, recenc
 <queryParser name="ltr" class="org.apache.solr.ltr.search.LTRQParserPlugin"/>
 
 <transformer name="features"
-             class="org.apache.solr.ltr.response.transform.LTRFeatureLoggerTransformerFactory"/>
+             class="org.apache.solr.ltr.response.transform.LTRFeatureLoggerTransformerFactory">
+  <str name="fvCacheName">QUERY_DOC_FV</str>
+</transformer>
 
-<cache name="QUERY_DOC_FV"
-       class="solr.search.CaffeineCache"
-       size="4096"
-       initialSize="1024"
-       autowarmCount="0"
-       regenerator="solr.NoOpRegenerator"/>
+<!-- Solr 10 uses a dedicated featureVectorCache element (the Solr 9.x form was a
+     generic <cache name="QUERY_DOC_FV" .../> declaration). -->
+<featureVectorCache class="solr.CaffeineCache"
+                    size="4096"
+                    initialSize="2048"
+                    autowarmCount="0"/>
 ```
 
 ### Defining a feature store
 
-POST to `/schema/feature-store`:
+PUT to `/schema/feature-store`:
 
 ```json
 [
@@ -313,7 +320,7 @@ POST to `/schema/feature-store`:
 
 ### Uploading a model
 
-POST to `/schema/model-store`. Start with `LinearModel` — it's debuggable. Graduate to `MultipleAdditiveTreesModel` (LambdaMART-style) once you have ≥10k labeled examples:
+PUT to `/schema/model-store`. Start with `LinearModel` — it's debuggable. Graduate to `MultipleAdditiveTreesModel` (LambdaMART-style) once you have ≥10k labeled examples:
 
 ```json
 { "store": "v1",
@@ -350,15 +357,15 @@ QueryResponse rsp = solr.query("shows", q);
 
 ### Feature-logging-only mode
 
-For extracting training data, log features without actually reranking by using a no-op model or `reRankDocs=1`:
+For extracting training data you don't need to rerank at all — the `[features]` transformer can log any feature store directly when you name the store explicitly:
 
 ```text
-q=stranger&rq={!ltr model=shows_v1 reRankDocs=1}&fl=id,score,[features efi.user_query=stranger]
+q=stranger&fl=id,score,[features store=v1 efi.user_query=stranger]
 ```
 
 Combine the resulting feature vectors with the implicit judgments from your signals collection to assemble an LTR training set.
 
-> **Production tip — `reRankDocs` is per-shard.** With 4 shards and `reRankDocs=200`, you actually rerank 800 docs. Watch the latency curve carefully; past ~500 effective docs reranked with a 50-tree model, p99 latency hockey-sticks.
+> **Production tip — `reRankDocs` is per-shard.** With 4 shards and `reRankDocs=200`, you actually rerank 800 docs. (This is implementation behavior — the rerank runs in each shard's query phase — rather than a documented contract, so re-verify after major upgrades.) Watch the latency curve carefully; past ~500 effective docs reranked with a 50-tree model, p99 latency hockey-sticks.
 
 > **Production tip — reload after upload.** The feature store and model store are *managed resources*. Per the Solr 10 reference guide, changes are not applied to active components until the collection is reloaded. Script the reload step into your model-deploy pipeline.
 
@@ -440,9 +447,9 @@ var req = new JsonQueryRequest()
 QueryResponse rsp = req.process(solr, "shows");
 ```
 
-> **Production tip — filter rare terms.** Add `"min_popularity": 0.001` to the `relatedness()` call to drop ultra-rare terms whose Z-score is statistically meaningless (added in SOLR-12581, shipped in Solr 7.7).
+> **Production tip — filter rare terms.** Use `"min_popularity": 0.001` to drop ultra-rare terms whose Z-score is statistically meaningless (added in SOLR-12581, shipped in Solr 7.5). It requires the extended `type:func` JSON-object form — `{"type":"func","func":"relatedness($fg,$bg)","min_popularity":0.001}` — not the plain string form used above.
 
-> **Production tip — `docValues="true"` required.** `relatedness()` requires `docValues="true"` on the faceted field. If your field is `indexed`-only, you'll get a runtime error or silently wrong counts on multi-shard collections.
+> **Production tip — facet on a `docValues="true"` field.** The sweep optimizations behind `relatedness()` are built around docValues, and high-cardinality fields get expensive. Also note `relatedness()` is undefined in an `allBuckets` context.
 
 **AIPS reference.** Chapter 5 ("Knowledge graph learning") — the entire chapter is built on this primitive. Original paper: Grainger, AlJadda, Korayem, Smith, "The Semantic Knowledge Graph," IEEE DSAA 2016 (arXiv:1609.00464).
 

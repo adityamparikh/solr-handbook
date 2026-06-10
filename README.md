@@ -2,7 +2,13 @@
 
 A code-first walkthrough of Apache Solr 10 for working JVM engineers — Lucene internals, schema design, search and relevance engineering, SolrCloud operations, the Model Context Protocol integration, and an honest comparison with Elasticsearch and OpenSearch.
 
-This repository is the [Quarto](https://quarto.org/) source for the book. It produces an HTML book site, a print-ready PDF, and an EPUB e-book from a single source.
+This repository is the [Quarto](https://quarto.org/) source for the book **and its companion code**. The book sources produce an HTML site, a print-ready PDF, and an EPUB from a single source; the [`code/`](code/) directory is a buildable Gradle project (Solr 10.0.0, SolrJ 10.0.0, Java 21) implementing the book's examples, with unit tests and Testcontainers integration tests that run against a real Solr 10 in Docker.
+
+```bash
+cd code
+./gradlew build              # compile + unit tests (no Docker needed)
+./gradlew integrationTest    # Testcontainers integration tests (requires Docker)
+```
 
 ## Quick start
 
@@ -36,6 +42,9 @@ solr-handbook/
 │   ├── references.qmd
 │   └── book-index.qmd       # alphabetical topic index
 ├── Makefile                 # render targets
+├── code/                    # companion code — Gradle project, SolrJ 10, Testcontainers
+│   ├── src/main/java/solrbook/   # indexing, search, relevance examples from the book
+│   └── src/test/java/solrbook/   # unit tests + Testcontainers integration tests
 ├── solr-10-handbook.md      # archive — pre-Quarto single-file source
 └── _book/                   # build output (git-ignored)
 ```

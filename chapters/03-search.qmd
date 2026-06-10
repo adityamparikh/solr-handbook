@@ -55,7 +55,7 @@ sequenceDiagram
 
 ### Why eDisMax wins for production
 
-eDisMax adds: support for full Lucene syntax inside the `q` string (so power users can do `platforms:Netflix`), proper escaping of bad input, phrase boosts on bigrams/trigrams (`pf2`, `pf3`), boost queries, and multiplicative boost functions.
+eDisMax adds: support for full Lucene syntax inside the `q` string (so power users can do `platforms:Netflix`), proper escaping of bad input, phrase boosts on bigrams/trigrams (`pf2`, `pf3`), and the multiplicative `boost` function (`bq`/`bf` boost queries already exist in plain DisMax).
 
 Key eDisMax params:
 
@@ -65,7 +65,7 @@ Key eDisMax params:
 | `pf` | Phrase boost: if the full query appears as a phrase in these fields, boost it |
 | `pf2`, `pf3` | Phrase boost on bigrams / trigrams |
 | `ps`, `ps2`, `ps3` | Phrase slop (positions allowed between phrase tokens) |
-| `mm` | Minimum should match: `mm=2<-1 5<80%` ("for queries up to 2 terms all must match; for 5+ terms at least 80%") |
+| `mm` | Minimum should match: `mm=2<-1 5<80%` ("up to 2 terms all must match; 3–5 terms all but one; 6+ terms at least 80%" — each conditional applies to queries with *more* terms than its threshold) |
 | `tie` | Tie-breaker between dismax (`0.0`) and sum (`1.0`); typically `0.1` |
 | `bq` | Additive boost query: `bq=status:ongoing^5` |
 | `boost` | Multiplicative boost function |
@@ -98,7 +98,7 @@ The `boost=recip(...)` clause multiplies the score by a value that decays with d
 ### SolrJ equivalent
 
 ```java
-import org.apache.solr.client.solrj.SolrQuery;
+import org.apache.solr.client.solrj.request.SolrQuery;   // moved to .request in SolrJ 10
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrDocumentList;
 
@@ -128,7 +128,7 @@ SolrDocumentList docs = resp.getResults();
 Solr exposes faceting in three ways:
 
 1. **Legacy field/range/query/pivot facets** via `facet.*` params. Simple, flat.
-2. **JSON Facet API** (recommended). Nested, composable, supports aggregations like `avg`, `percentile`, `unique`. Introduced in Solr 6.0, per Yonik Seeley's original announcement on yonik.com (April 17, 2015): *"Solr 5 has a completely re-written faceted search and analytics module with a structured JSON API."*
+2. **JSON Facet API** (recommended). Nested, composable, supports aggregations like `avg`, `percentile`, `unique`. First shipped in Solr 5.1, per Yonik Seeley's original announcement on yonik.com (April 17, 2015): *"Solr 5 has a completely re-written faceted search and analytics module with a structured JSON API."*
 3. **Pivot facets** for hierarchical multi-field facets (the JSON API supersedes most uses).
 
 ### Legacy field facet
@@ -213,9 +213,9 @@ The execution costs of each of these are covered in detail in §1.4. The short v
 
 ## 3.5 Relevance scoring — BM25 in honest detail
 
-Solr 10 ships **BM25Similarity** as the default. BM25 became the default similarity in Solr 5.0.0 (SOLR-8270/SOLR-8271): *"SchemaSimilarityFactory has been modified to use BM25Similarity as the default for fieldTypes that do not explicitly declare a Similarity. The legacy behavior of using ClassicSimilarity as the default will occur if the luceneMatchVersion for the collection is less than 5.0."* TF-IDF (`ClassicSimilarity`) survives but is legacy.
+Solr 10 ships **BM25Similarity** as the default. BM25 became the default similarity in Solr 6.0.0 (SOLR-8261/SOLR-8329; the Lucene-side switch was LUCENE-6789). The Solr 6.0 upgrade notes read: *"SchemaSimilarityFactory has been modified to use BM25Similarity as the default for fieldTypes that do not explicitly declare a Similarity. The legacy behavior of using ClassicSimilarity as the default will occur if the luceneMatchVersion for the collection is less than 6.0."* TF-IDF (`ClassicSimilarity`) survives but is legacy.
 
-The Lucene Javadoc for `BM25SimilarityFactory` defines the parameters explicitly: *"k1 (float): Controls non-linear term frequency normalization (saturation). The default is 1.2 · b (float): Controls to what degree document length normalizes tf values. The default is 0.75."*
+The Solr Javadoc for `BM25SimilarityFactory` defines the parameters explicitly: *"k1 (float): Controls non-linear term frequency normalization (saturation). The default is 1.2 · b (float): Controls to what degree document length normalizes tf values. The default is 0.75."*
 
 ### The BM25 formula
 
@@ -311,7 +311,7 @@ That syntax says: "find the top-20 nearest neighbors of the given query vector i
 
 ### HNSW: how the graph walk actually works
 
-HNSW is a **layered proximity graph**. Every vector you index becomes a node. Edges connect each node to its approximate nearest neighbors (up to `M = hnswMaxConnections`, default 16). The trick: not every node lives on every layer. A small fraction of nodes are randomly promoted to higher layers, where they form a sparser graph with longer edges. The top layer has only a handful of nodes; the bottom layer (layer 0) has every node.
+HNSW is a **layered proximity graph**. Every vector you index becomes a node. Edges connect each node to its approximate nearest neighbors (up to `M = hnswM`, default 16; this schema attribute was named `hnswMaxConnections` in Solr 9.x and was renamed — along with `hnswBeamWidth` → `hnswEfConstruction` — in Solr 10). The trick: not every node lives on every layer. A small fraction of nodes are randomly promoted to higher layers, where they form a sparser graph with longer edges. The top layer has only a handful of nodes; the bottom layer (layer 0) has every node.
 
 ```{mermaid}
 %%| label: fig-03-hnsw-graph-walk
@@ -353,7 +353,7 @@ The walk has two phases — a greedy descent through the upper layers, then a wi
 2. **Greedy step:** look at all neighbors of the current node. If any neighbor is closer to the query than the current node, move to the closest one. Repeat until no neighbor improves distance. This finds the local minimum on this layer.
 3. **Descend** to the next layer, using the local minimum as the entry point.
 4. **Repeat** until you reach layer 0.
-5. **At layer 0**, do an exhaustive search of a candidate pool of size `efSearch` (default = `topK`). Return the `topK` closest from that pool.
+5. **At layer 0**, do an exhaustive search of a candidate pool of size efSearch = `efSearchScaleFactor × topK` (the scale factor defaults to 1.0 and is new in Solr 10, SOLR-17928). Return the `topK` closest from that pool.
 
 Why this is fast: each layer halves the search space. The top layers do long jumps over the vector space, like the express lanes of a skip list; the bottom layer does fine-grained local refinement. Visiting ~20 nodes out of 15,000 vectors is typical, vs. 15,000 brute-force distance computations.
 
@@ -407,7 +407,7 @@ For the underlying math, see the [Wikipedia article on cosine similarity](https:
 
 ### What's new in Solr 10 for vectors
 
-The Solr 10.0 reference guide explicitly lists, as new features: *"Scalar and binary quantized dense vectors are now supported for DenseVectorField (SOLR-17780, SOLR-17812). Quantization reduces memory consumption and can improve search performance at some cost to accuracy."* And: *"GPU-accelerated approximate nearest neighbor search is now available via the cuVS-Lucene pluggable codec (SOLR-17892)."*
+The Solr 10.0 release notes explicitly list, as new features: *"Scalar and binary quantized dense vectors are now supported for DenseVectorField (SOLR-17780, SOLR-17812). Quantization reduces memory consumption and can improve search performance at some cost to accuracy."* And: *"GPU-accelerated approximate nearest neighbor search is now available via the cuVS-Lucene pluggable codec (SOLR-17892)."*
 
 A binary-quantized field (1 bit per dimension instead of 32):
 
@@ -476,7 +476,7 @@ The raw scores live on totally different scales — BM25 is unbounded positive, 
 
 | Document | BM25 rank | KNN rank | RRF calculation | RRF score |
 |---|---|---|---|---|
-| `MH-001` | 1 | 2 | `1/(60+1) + 1/(60+2)` | **0.03253** |
+| `MH-001` | 1 | 2 | `1/(60+1) + 1/(60+2)` | **0.03252** |
 | `BB-001` | 2 | 4 | `1/(60+2) + 1/(60+4)` | **0.03175** |
 | `BM-001` | 3 | 3 | `1/(60+3) + 1/(60+3)` | **0.03175** |
 | `SVR-001` | — | 1 | `0 + 1/(60+1)` | **0.01639** |
@@ -487,7 +487,7 @@ Sorted final ranking:
 
 1. `MH-001` (Mindhunter) — strong in **both** lists. Wins decisively despite not being a sci-fi show, because both retrievers agree on its "dark psychological" character.
 2. `BB-001` (Breaking Bad) — good in both. Second. Same kind of cross-retriever agreement.
-3. `BM-001` (Black Mirror) — good in both, tied with `BB-001`.
+3. `BM-001` (Black Mirror) — good in both, tied with `BB-001` at the displayed precision (`BB-001` is higher by about 8×10⁻⁶).
 4. `WW-001` (Westworld) — present in both but ranked lower; still beats the vector-only hit.
 5. `SVR-001` (Severance) — vector-only hit. A pure semantic match the keyword retriever missed because the query didn't share many lexical tokens with the synopsis. **This is exactly what RRF protects against** in pure-BM25 systems: semantic matches that have no keyword overlap.
 
@@ -547,7 +547,7 @@ resp.getSpellCheckResponse().getCollatedResults();    // returns "stranger thing
 &hl=true&hl.fl=title,description&hl.fragsize=160&hl.tag.pre=<mark>&hl.tag.post=</mark>
 ```
 
-Returns matched snippets per doc with HTML markers around hit terms. Use the unified highlighter (`hl.method=unified`) for performance on long fields with positions+offsets indexed.
+Returns matched snippets per doc with HTML markers around hit terms. The unified highlighter (`hl.method=unified`) is the default in Solr 10; for long fields, index with `storeOffsetsWithPositions="true"` to keep it fast.
 
 ## 3.9 Result grouping with the Collapse query parser
 
@@ -590,7 +590,8 @@ uniqueKey:        id
 schema:           <uniqueKey>id</uniqueKey>
 indexed id value: "STAR-WARS!TM-001"
                    └─prefix──┘ └suffix─┘
-routing:          murmur3("STAR-WARS") % shardCount
+routing:          MurmurHash3("STAR-WARS") → upper bits of the 32-bit hash,
+                  mapped to the shard whose hash range contains it
 ```
 
 The string before the `!` in the `id` is hashed; everything after the `!` is part of the unique identifier but ignored for routing. So `STAR-WARS!TM-001`, `STAR-WARS!LK-001`, and `STAR-WARS!AND-001` all land on the same shard. The collapse field (`franchise_id` in the example) is a **separate** field whose value matches the prefix (`"STAR-WARS"`) — you'd set both at index time.
@@ -721,7 +722,6 @@ try (var client = new CloudSolrClient.Builder(
     ModifiableSolrParams build = new ModifiableSolrParams();
     build.set("qt", "/suggest");
     build.set("suggest.buildAll", "true");
-    build.set("distrib", "true");                  // fan out to every shard
     var buildReq = new QueryRequest(build);
     buildReq.setPath("/suggest");
     client.request(buildReq);
@@ -744,7 +744,7 @@ try (var client = new CloudSolrClient.Builder(
 
 > **Production tip — never `buildOnCommit=true`.** A rebuild on every soft commit will starve query traffic under any non-trivial write load. Build on a schedule (cron / Kubernetes `CronJob`) at whatever cadence matches your dictionary churn.
 
-> **Production tip — build every shard.** In SolrCloud the suggester data structure is per-replica. After a build, suggestions reflect only the replicas you built. Pass `distrib=true` (as above) or fan out explicitly.
+> **Production tip — build every replica.** In SolrCloud the suggester data structure is per-replica, and a distributed request reaches only *one replica per shard* — so a single build request leaves other replicas serving stale (or empty) suggestions. Build on every replica: iterate the replica core URLs from cluster state and issue the build against each, or use `buildOnStartup=true` for small dictionaries.
 
 Further detail — alternative lookup implementations (`BlendedInfix`, `Fuzzy`, `FST`), `suggest.cfq` context filtering, expression-based weights — is in the [Solr Suggester reference](https://solr.apache.org/guide/solr/latest/query-guide/suggester.html).
 
@@ -814,7 +814,7 @@ A mature autocomplete UX runs **both**: SuggestComponent on `/suggest` returns a
 - Default to **eDisMax** for any user-facing search. Master `qf`, `pf`, `mm`, `tie`, `bq`, `boost`.
 - BM25 is the default similarity (since Solr 6); tune `k1` and `b` only with measured relevance metrics in hand.
 - The JSON Facet API (Solr 5+) is the modern way to compute facets and sub-aggregations.
-- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser, tune `efSearch`.
+- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser; tune `topK` and `efSearchScaleFactor`.
 - For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** (SOLR-17319, fix versions 10.1 and 9.11).
 
 ---

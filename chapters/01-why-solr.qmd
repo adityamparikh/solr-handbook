@@ -67,7 +67,7 @@ world      1    3→(1,[3])
 
 `df` is **document frequency** (how many documents contain the term). For each match Lucene stores `tf` (term frequency in that doc) and optionally positions, payloads, and offsets.
 
-Looking up `stranger` is an `O(log V)` operation in the term dictionary (where V is vocabulary size — typically much smaller than the document count); the posting list itself is a sorted, delta-encoded, block-compressed stream of doc IDs. The conjunction `stranger AND thing` is a **leap-frog intersection** of two sorted streams, skipping with auxiliary skip-lists. The whole operation is fast even at billions of documents. Notice also that Porter stemming maps both `strange` and `strangers` to `strang` — but *not* `stranger`, which stays as its own root (`stranger`). This is a real quirk of the English Porter stemmer and a recurring source of "why didn't my synonym work?" confusion (covered in §2.4).
+Looking up `stranger` is an `O(log V)` operation in the term dictionary (where V is vocabulary size — typically much smaller than the document count); the posting list itself is a sorted, delta-encoded, block-compressed stream of doc IDs. The conjunction `stranger AND thing` is a **leap-frog intersection** of two sorted streams, skipping with auxiliary skip-lists. The whole operation is fast even at billions of documents. Notice also that Porter stemming maps `strange` to `strang` but `strangers` only to `stranger` (the plural `-s` is stripped; `-er` never is) — three related surface forms, two distinct roots that never collapse together. This is a real quirk of the English Porter stemmer and a recurring source of "why didn't my synonym work?" confusion (covered in §2.4).
 
 ## 1.3 What's actually in a Lucene index
 
@@ -180,7 +180,7 @@ flowchart LR
 
 **Cost:** depends on how many terms share the prefix. `strang*` might match 50 terms; `s*` might match 50,000. Lucene auto-rewrites broad prefix queries into a constant-score form to keep this bounded.
 
-> **Production tip — the `maxBooleanClauses` trap.** Internally a prefix query expands into an OR of all matched terms. Solr caps the clause count (default 1024, configurable in `solrconfig.xml`). Very broad prefixes can throw `TooManyClauses` or silently fall back to a non-scored rewrite. If you intentionally search broad prefixes, either raise the cap or restrict the prefix.
+> **Production tip — the `maxBooleanClauses` trap.** Solr caps boolean clause counts (default 1024 — since Solr 9 enforced node-wide in `solr.xml` and per-collection in `solrconfig.xml`). Prefix and wildcard queries use a constant-score rewrite *by default*, so they rarely hit the cap; you'll see `TooManyClauses` mainly with scoring rewrites or machine-generated boolean queries. If you legitimately need huge boolean queries, raise the cap deliberately — and know why.
 
 ### 1.4.5 Wildcard query: `q=title:t?ings` and the leading-wildcard problem
 
@@ -293,7 +293,7 @@ Indexing `"crown"` with min=3 max=6 produces the tokens `cro`, `crow`, `crown`, 
 
 Fuzzy matches all terms within a small edit distance of `thinngs` (a few character insertions, deletions, or substitutions — here the extra `n` is a typo). Internally Lucene uses the term dictionary's sorted structure to enumerate candidate terms efficiently — it does *not* compare against every term one by one. Useful when a user mistypes `breking bad` instead of `breaking bad`.
 
-**Cost:** dominated by how many terms fall within the edit-distance window. Short query terms with `~2` produce huge candidate sets; longer terms produce small ones. Setting `fuzzyPrefixLength=1` or `2` (requiring the first character(s) to match exactly) is the standard way to keep fuzzy queries tractable on large dictionaries.
+**Cost:** dominated by how many terms fall within the edit-distance window. Short query terms with `~2` produce huge candidate sets; longer terms produce small ones. Requiring the first character(s) to match exactly — `prefixLength=1` or `2` on the dedicated fuzzy query parser, e.g. `{!fuzzy f=title prefixLength=2}thinngs` — is the standard way to keep fuzzy queries tractable on large dictionaries.
 
 If you need misspelling tolerance for *user* input, the spell checker (§3.7) is almost always a better answer than fuzzy queries.
 
@@ -303,7 +303,7 @@ There are two different stories depending on the field type.
 
 **For `string` ranges** (e.g., `id:[A TO M]`): walk the term dictionary forward from the lower bound, OR all postings, stop at the upper bound. Same machinery as prefix.
 
-**For numeric `Point` fields** (`pint`, `pfloat`, `pdate` — default in Solr 9+): the data is **not** in the inverted index at all. Numeric points use a separate indexed structure optimized for range queries. A range query descends to the relevant subtrees and emits matching doc ids directly — much faster than equivalent term ranges, especially for narrow ranges over wide values. This is why the legacy `TrieIntField` was deprecated in favor of `IntPointField`.
+**For numeric `Point` fields** (`pint`, `pfloat`, `pdate` — the default since Solr 7; the deprecated `Trie*` fields were removed in Solr 9): the data is **not** in the inverted index at all. Numeric points use a separate indexed structure optimized for range queries. A range query descends to the relevant subtrees and emits matching doc ids directly — much faster than equivalent term ranges, especially for narrow ranges over wide values. This is why the legacy `TrieIntField` was deprecated in favor of `IntPointField`.
 
 If you want the data structure behind point fields, search for "Lucene BKD tree".
 
