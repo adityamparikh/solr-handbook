@@ -324,7 +324,7 @@ Vector queries skip the inverted index entirely. They walk the **HNSW graph** (t
 | Phrase / proximity | Adds positions | More expensive than the underlying AND |
 | Prefix | Term dictionary forward scan + postings | `strang*` cheap, `s*` expensive |
 | Wildcard | Same, scoped by leading literal | Leading wildcards (`*hings`) are expensive |
-| Fuzzy | Term dictionary, edit-distance window | Use `fuzzyPrefixLength` to bound cost |
+| Fuzzy | Term dictionary, edit-distance window | Use `{!fuzzy}` with `prefixLength` to bound cost |
 | Numeric range | Numeric point index (separate structure) | Very fast |
 | String range | Term dictionary forward scan | Like prefix |
 | Function query (boost) | Doc values only | No candidate filtering |

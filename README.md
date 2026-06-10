@@ -49,6 +49,10 @@ solr-handbook/
 └── _book/                   # build output (git-ignored)
 ```
 
+## Rendered artifacts
+
+`dist/` holds the PDF and EPUB from the last release render. They are rebuilt with `make` at release time and may lag the chapter sources between releases — the `.qmd` files in `chapters/` are the source of truth.
+
 ## Output formats
 
 | Target | Command | Output | Notes |

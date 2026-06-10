@@ -17,7 +17,7 @@ References are grouped by type. Throughout the book, the first mention of any so
 
 ### JIRA tickets cited in the text
 
-- **SOLR-8270 / SOLR-8271** — BM25Similarity becomes default (Solr 6).
+- **SOLR-8261 / SOLR-8329** — BM25Similarity becomes default (Solr 6.0; the Lucene-side switch was LUCENE-6789).
 - **SOLR-9480** — `relatedness()` aggregation for JSON Faceting / Semantic Knowledge Graph.
 - **SOLR-12581** — `min_popularity` parameter for `relatedness()`.
 - **SOLR-14656** — Autoscaling framework removed (Solr 9.0).
