@@ -57,9 +57,11 @@ class VectorSearchIntegrationTest {
 
   @Test
   void rerankBlendsVectorSimilarityIntoLexicalResults() throws Exception {
+    // A single-term query: the §3.2 mm spec ("2<-1 ...") requires ALL terms of a
+    // two-term query to match, and the rerank can only reorder what BM25 retrieved.
     var hybrid =
         KnnSearch.rerankWithVectors(
-            EdismaxSearch.showsQuery("thriller drama"), "embedding", 50, 2.0, DARK_SCIFI);
+            EdismaxSearch.showsQuery("mystery"), "embedding", 50, 2.0, DARK_SCIFI);
     QueryResponse resp = solr.query(SolrTestHarness.SHOWS, hybrid);
     assertTrue(resp.getResults().getNumFound() > 0);
   }

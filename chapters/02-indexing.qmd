@@ -108,6 +108,8 @@ The configset is the bundle of files that defines how a collection behaves. The 
 
 Configset *management* — uploading with `bin/solr zk upconfig` or the [ConfigSets API](https://solr.apache.org/guide/solr/latest/configuration-guide/configsets-api.html), sharing across environments, versioning — is a SolrCloud topic and lives in §4.8.
 
+> **Production tip — shared configsets share schema edits.** If you create a collection *without* naming a configset, Solr copies `_default` into a fresh per-collection configset. If you explicitly bind several collections to the *same* configset (including `_default` itself), every Schema API change you make through one collection applies to all of them — and a second "create the same fields" setup script fails with "field already exists". Bind collections to a shared configset only when you *want* them schema-locked together; otherwise give each collection its own.
+
 ### Cores vs replicas vs collections
 
 A reliable source of confusion. Three terms, distinct levels:

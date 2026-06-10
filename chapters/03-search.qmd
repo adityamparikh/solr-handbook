@@ -564,18 +564,20 @@ For this example, assume the schema has been extended with a `franchise_id` fiel
 
 ```text
 q=star wars
-&fq={!collapse field=franchise_id max=rating}
+&fq={!collapse field=franchise_id max=rating nullPolicy=expand}
 &expand=true
 &expand.rows=4
 &fl=id,title,rating,franchise_id
 ```
+
+> **Gotcha — `nullPolicy`.** The default (`nullPolicy=ignore`) drops every document that has *no* value in the collapse field from the results entirely, and `nullPolicy=collapse` merges all of them into a single group — both surprising when only some documents carry `franchise_id`. For a sparsely-populated collapse field like this one, `nullPolicy=expand` (each null document is its own group) is almost always what you want.
 
 From SolrJ:
 
 ```java
 SolrQuery q = new SolrQuery(userQuery)
     .setRequestHandler("/select")
-    .addFilterQuery("{!collapse field=franchise_id max=rating}")
+    .addFilterQuery("{!collapse field=franchise_id max=rating nullPolicy=expand}")
     .setFields("id,title,rating,franchise_id");
 q.set("expand", "true");
 q.set("expand.rows", "4");

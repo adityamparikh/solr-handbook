@@ -69,10 +69,16 @@ public final class SolrTestHarness {
     return c;
   }
 
-  /** Creates a fresh single-shard collection on the shared container. */
+  /**
+   * Creates a fresh single-shard collection on the shared container. The configset is
+   * deliberately NOT specified: Solr then copies {@code _default} into a per-collection
+   * configset. Passing {@code "_default"} explicitly would make every collection SHARE
+   * the live {@code _default} configset, and the second collection's Schema API setup
+   * would collide with fields the first one already added.
+   */
   public static SolrClient createCollection(String name) throws Exception {
     SolrClient c = client();
-    CollectionAdminRequest.createCollection(name, "_default", 1, 1).process(c);
+    CollectionAdminRequest.createCollection(name, 1, 1).process(c);
     return c;
   }
 }
