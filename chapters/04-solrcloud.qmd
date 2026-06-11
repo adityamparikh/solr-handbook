@@ -6,7 +6,9 @@
 >
 > **You will learn:** Why SolrCloud needs ZooKeeper and what ZK actually stores; the differences between collections, shards, replicas, and cores; the three replica types (NRT, TLOG, PULL) and when to use each; how compositeId routing works (referenced in §3.9 Collapse); how leader election survives node failures; how to issue Collections API commands from SolrJ; how scatter-gather distributed queries actually work; and how to deploy a production cluster on Kubernetes with the Apache Solr Operator.
 >
-> **What you should not skip:** §4.4 (replica types — the most consequential design decision in a SolrCloud cluster) and §4.12 (Kubernetes deployment, including the honest assessment of the Operator's Solr 10 support).
+> **What you should not skip:** §4.4 (replica types — the most consequential design decision in a SolrCloud cluster), §4.12 (Kubernetes deployment, including the honest assessment of the Operator's Solr 10 support), and §4.13 (security — Solr ships with none).
+>
+> **Companion code:** the §4.13 security setup runs as a Testcontainers test — `security.json` uploaded to a live cluster, then 401/200/403 asserted for anonymous, authorized, and unauthorized-but-authenticated callers — in [`code/src/test/java/solrbook/indexing/SecurityIntegrationTest.java`](https://github.com/adityamparikh/solr-handbook/tree/main/code).
 
 ## 4.1 The Solr 10 cluster picture
 
@@ -409,7 +411,96 @@ flowchart TB
 
 The operator handles: StatefulSet creation, headless service, PVC templates, rolling restarts on config change, TLS cert mounting, optional Prometheus exporter sidecar, and (in newer versions) managed scale up/scale down with replica balancing on Solr 9.3+.
 
-## 4.13 Monitoring
+## 4.13 Securing the cluster
+
+Everything so far assumed a trusted network. Out of the box, Solr has **no authentication, no authorization, and no TLS** — anyone who can reach port 8983 can read every document, delete every collection, and edit every config. Solr's CVE history is mostly stories about clusters that should never have been reachable in the first place. Treat the following as the floor for any deployment that holds non-public data.
+
+### Rule zero: network posture
+
+Solr is a backend. It belongs behind a firewall, reachable only by your application servers and (for the admin UI) your operators' bastion or VPN — never the public internet. Authentication is the second layer, not a substitute for this one. The admin UI itself is a development tool: front it with an authenticating reverse proxy in production, or disable it with `SOLR_OPTS="-Dsolr.ui.enabled=false"` (§2.0).
+
+### `security.json`: authentication + authorization in one file
+
+Solr's whole security configuration lives in a single document, `security.json`, stored in ZooKeeper. The canonical starter — Basic authentication plus rule-based authorization — looks like this (this is the reference guide's own example, with the documented `solr`/`SolrRocks` bootstrap user):
+
+```json
+{
+  "authentication": {
+    "blockUnknown": true,
+    "class": "solr.BasicAuthPlugin",
+    "credentials": {
+      "solr": "IV0EHq1OnNrj6gvRCwvFwTrZ1+z1oBbnQdiVC3otuq0= Ndd7LKvVBAaZIF0QAVi1ekCfAJXr1GGfLtRUXhgrF8c="
+    },
+    "realm": "shows-cluster",
+    "forwardCredentials": false
+  },
+  "authorization": {
+    "class": "solr.RuleBasedAuthorizationPlugin",
+    "permissions": [
+      { "name": "security-edit", "role": "admin" },
+      { "name": "update",        "role": "admin" }
+    ],
+    "user-role": { "solr": ["admin"] }
+  }
+}
+```
+
+The pieces worth understanding rather than copying:
+
+- **`blockUnknown: true`** (the default when omitted) rejects every unauthenticated request. Setting it to `false` is a trap: any request not explicitly matched by a permission becomes anonymous-accessible.
+- **Password encoding** is `base64(sha256(sha256(salt+password)))` followed by `base64(salt)`, space-separated. You rarely compute this by hand — bootstrap with the documented example user, then manage real users through the API below, which hashes server-side.
+- **`forwardCredentials: false`** lets Solr's internal PKI authentication handle node-to-node requests instead of forwarding the user's Basic header — the right default.
+- **Permissions are evaluated top-down, and the catch-all rule is permissive:** an authenticated request that matches *no* permission is **allowed**. That's why the example pins `update` to the `admin` role — without it, any authenticated user could write. If you want default-deny for authenticated users too, add `{"name": "all", "role": "admin"}` as the *last* permission. The predefined permission names (`read`, `update`, `security-edit`, `schema-edit`, `config-edit`, `collection-admin-edit`, `metrics-read`, `health`, …) are in the [Rule-Based Authorization reference](https://solr.apache.org/guide/solr/latest/deployment-guide/rule-based-authorization-plugin.html).
+
+### Deploying and changing it
+
+Upload once to ZooKeeper and the cluster picks it up live — no restart:
+
+```bash
+bin/solr zk cp ./security.json zk:security.json -z localhost:2181
+```
+
+After that, **edit through the APIs, not the file**. The Authentication and Authorization APIs hash passwords for you and update the live configuration atomically:
+
+```bash
+# Add or update a user (as an admin):
+curl -u solr:SolrRocks -H 'Content-type:application/json' \
+  http://localhost:8983/solr/admin/authentication \
+  -d '{"set-user": {"reader": "readerPass"}}'
+
+# Give them a role and protect reads:
+curl -u solr:SolrRocks -H 'Content-type:application/json' \
+  http://localhost:8983/solr/admin/authorization \
+  -d '{"set-user-role": {"reader": ["readers"]},
+       "set-permission": {"name": "read", "role": ["readers", "admin"]}}'
+```
+
+Two caveats from the reference guide: if you do hand-edit the file in ZooKeeper, strip the trailing version marker (`{"v":138}`) or the update won't propagate; and while *settings* reload live, **changing the plugin class itself requires a JVM restart**.
+
+### The client side: SolrJ
+
+Cluster-wide credentials go on the HTTP client builder; one-off credentials go on the request:
+
+```java
+SolrClient solr = new HttpJettySolrClient.Builder(baseUrl)
+    .withBasicAuthCredentials("svc-search", password)   // every request
+    .build();
+
+new SolrQuery("*:*")                                     // or per request:
+    .setBasicAuthCredentials("auditor", auditorPassword);
+```
+
+Keep service accounts per application (one for the indexer with `update`, one for the search API with `read`) so a leaked credential has a bounded blast radius.
+
+### TLS, ZooKeeper ACLs, and SSO
+
+- **TLS** is driven by environment variables in `solr.in.sh`: `SOLR_SSL_ENABLED=true`, `SOLR_SSL_KEY_STORE`/`SOLR_SSL_KEY_STORE_PASSWORD`, `SOLR_SSL_TRUST_STORE`, plus `SOLR_SSL_NEED_CLIENT_AUTH` for mutual TLS and `SOLR_SSL_CLIENT_HOSTNAME_VERIFICATION` for strictness. Basic auth sends credentials in plain text — *"it's recommended to use SSL for communication when Basic authentication is enabled"* is the reference guide's polite way of saying "always."
+- **ZooKeeper ACLs.** `security.json` lives in ZooKeeper — if ZK is open, your security config is writable by anyone who can reach port 2181, and everything above is theatre. Lock the znodes down per the [ZooKeeper Access Control](https://solr.apache.org/guide/solr/latest/deployment-guide/zookeeper-access-control.html) page whenever a security plugin is in use.
+- **JWT / OIDC.** For SSO against Keycloak, Okta, Entra and friends, the `JWTAuthPlugin` (the `jwt-auth` module) validates IdP-issued bearer tokens instead of passwords — the same pattern the MCP server uses in §6.7.2. Certificate authentication is also available for service-to-service setups.
+
+> **Production tip — test your authorization rules, not just your authentication.** The "unmatched requests are allowed" default means a missing permission fails *open* for authenticated users. The companion code's `SecurityIntegrationTest` enables Basic auth on a Testcontainers Solr and asserts all three outcomes — anonymous 401, authorized 200, and *authenticated-but-unauthorized 403* — which is exactly the regression test that catches a permission someone deleted "because it broke staging."
+
+## 4.14 Monitoring
 
 Solr 10 *"migrated from Dropwizard metrics to OpenTelemetry (OTEL) for observability. This migration provides native Prometheus support, OTLP support, exemplar support for tracing correlation, and native attributes and labels on all metrics. All metrics have been migrated to snake-case metric names instead of dot-delimited format"* (Major Changes in Solr 10).
 
@@ -429,7 +520,7 @@ The `/admin/metrics` API now defaults to Prometheus exposition format. Pipe it i
 3. **Trace a failover.** Walk through the leader-election sequence (§4.6) when the current leader of `shard1` of a 3-replica collection (1 NRT leader, 2 NRT followers) crashes. At each step, identify which ZooKeeper znode changes, which Solr node takes which action, and how long the collection is unavailable for writes.
 4. **Build the Kubernetes spec.** Adapt the SolrCloud CR in §4.12 for a 5-node cluster spread across 3 availability zones with 200 GB SSD per pod and a separate ZK ensemble. Add an Ingress for the Admin UI. Validate that your anti-affinity rules prevent two replicas of the same shard from landing on the same node.
 
-## 4.14 Chapter summary
+## 4.15 Chapter summary
 
 - Solr 10 makes SolrCloud the default; standalone survives as `--user-managed`. Underlying engine: Lucene 10.3, Jetty 12, Java 21 server.
 - ZooKeeper holds cluster state and configsets; keep it on dedicated nodes. Overseer-less mode is opt-in in Solr 10 (likely default in 11).

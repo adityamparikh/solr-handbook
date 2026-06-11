@@ -47,9 +47,12 @@ The integration tests pull the Docker Official Image `solr:10.0.0` on first run.
   the Schema API, index the seed catalog, and exercise: eDisMax relevance, JSON facets,
   collapse/expand, `relatedness()`, atomic vs. in-place updates, optimistic-concurrency
   409s, cursorMark reindex + alias swap, `{!knn}` vector search, hybrid rerank,
-  client-side RRF, and the full `language-models` text-to-vector lifecycle (the
+  client-side RRF, the full `language-models` text-to-vector lifecycle (the
   container runs with `SOLR_MODULES=language-models`, and a local OpenAI-compatible
-  stub stands in for the embedding service so the test is hermetic).
+  stub stands in for the embedding service so the test is hermetic), and §4.13's
+  security setup (`SecurityIntegrationTest` enables Basic auth on a live cluster via
+  `security.json` in ZooKeeper and asserts 401/200/403 — on its own container, since
+  flipping auth on would break the shared one).
 
 CI runs both suites on every push that touches `code/` (see
 `.github/workflows/code-ci.yml`).

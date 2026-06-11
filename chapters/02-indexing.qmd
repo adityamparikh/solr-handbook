@@ -62,7 +62,7 @@ The tabs you'll actually use:
 
   - **Documents** — Add a single document via JSON, XML, or CSV. Handy for one-off testing.
 
-> **Production tip — don't expose the admin UI to the public internet.** It's a development tool. In production, fence it off with a reverse proxy that requires authentication, or set `SOLR_OPTS="-Dsolr.ui.enabled=false"` if you genuinely don't need it. The production observability stack lives in §4.13.
+> **Production tip — don't expose the admin UI to the public internet.** It's a development tool. In production, fence it off with a reverse proxy that requires authentication, or set `SOLR_OPTS="-Dsolr.ui.enabled=false"` if you genuinely don't need it. The production observability stack lives in §4.14, and cluster-wide authentication in §4.13.
 
 ## 2.1 What is a collection?
 
