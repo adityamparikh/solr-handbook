@@ -9,6 +9,8 @@
 > **What you should not skip:** §5.1 (measurement — without numbers, the rest of the chapter is theatre) and §5.3 (signals boosting — the highest-ROI relevance technique most teams haven't shipped).
 >
 > The first four sections compress the practical core of *AI-Powered Search* (Grainger, Turnbull, Irwin — Manning, 2025) into the minimum a Solr engineer needs to be dangerous. §5.5 covers Solr's built-in `relatedness()` aggregation (SOLR-9480) for ad-hoc relationship mining. §5.6 covers editorial overrides — the manual sibling of automated boosting.
+>
+> **Companion code:** the NDCG@k implementation (unit-tested against hand-computed values), the signals weight normalization, and the signals-boost expression builder live in [`code/src/main/java/solrbook/relevance/`](https://github.com/adityamparikh/solr-handbook/tree/main/code); the `relatedness()` query runs as an integration test in `solrbook.search.FacetSearch`.
 
 ```{mermaid}
 %%| label: fig-05-relevance-loop

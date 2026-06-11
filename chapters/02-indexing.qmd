@@ -7,6 +7,8 @@
 > **You will learn:** How to design a Solr schema that you won't regret in six months, how the analyzer chain transforms text at index and query time, how to index from Java with SolrJ at production throughput, how to test against a real Solr with Testcontainers, when to use atomic vs. in-place updates and the trap of silently falling back, how to do zero-downtime reindexes with collection aliases, and how to think about commits.
 >
 > **What you should not skip:** §2.8 (partial updates — the single most misunderstood topic in production Solr) and §2.9 (reindexing — when you must, when you don't, and how).
+>
+> **Companion code:** every pattern in this chapter — the seed catalog, the Schema API setup, bulk indexing, atomic/in-place updates, optimistic concurrency, the cursorMark reindexer, and the alias swap — is runnable and Testcontainers-tested in [`code/src/main/java/solrbook/indexing/`](https://github.com/adityamparikh/solr-handbook/tree/main/code).
 
 ## 2.0 Running Solr locally
 

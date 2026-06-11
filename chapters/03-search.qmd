@@ -7,6 +7,8 @@
 > **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search and HNSW work, with a worked cosine-similarity example; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
 >
 > **What you should not skip:** §3.5 (BM25 in honest detail) and §3.6 (vector search and hybrid retrieval — the future of every search bar).
+>
+> **Companion code:** the eDisMax query, JSON facets, `{!knn}` vector search, the rerank hybrid, client-side RRF (reproducing this chapter's worked table in a unit test), and collapse/expand all run against a real Solr 10 in [`code/src/main/java/solrbook/search/`](https://github.com/adityamparikh/solr-handbook/tree/main/code).
 
 ## 3.1 Query anatomy
 
