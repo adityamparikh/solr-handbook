@@ -23,6 +23,8 @@ Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powe
 > - **Metrics.** Dropwizard → OpenTelemetry. Metric names changed from Dropwizard's dot-delimited style (e.g. `QUERY./select.requestTimes` with its percentile attributes) to snake_case OpenTelemetry names. Existing Prometheus dashboards will break.
 > - **`bin/solr delete`** no longer deletes a configset when you delete a collection — you must now explicitly pass `--delete-config`. In 9, a configset used by only one collection was deleted automatically.
 > - **Removed modules.** `jaegertracer-configurator`, `analytics`, `hadoop-auth`. If you used any of these, you need a replacement.
+>
+> The full consolidated 9→10 checklist — server, schema, SolrJ, and post-upgrade verification — is [Appendix A](../back-matter/appendix-upgrade-9-to-10.qmd).
 
 ```{mermaid}
 %%| label: fig-04-solrcloud-topology
