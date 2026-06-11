@@ -287,7 +287,7 @@ Before walking into the vector mechanics, it helps to see how lexical and vector
 flowchart TB
     DOC["DOCUMENT<br/>'Apache Solr powers fast scalable search'"]
     DOC --> TXT["TEXT ANALYSIS<br/>(Lucene analyzer chain)"]
-    DOC --> EMB["EMBEDDING MODEL<br/>(external API call,<br/>e.g. OpenAI text-embedding-3-small)"]
+    DOC --> EMB["EMBEDDING MODEL<br/>(external service, called by your app —<br/>or by Solr itself via the<br/>language-models module)"]
 
     TXT --> TOK["Tokens:<br/>apach, solr, power,<br/>fast, scalabl, search"]
     EMB --> VEC["Vector: 384 or 1536 floats<br/>[0.12, -0.45, 0.78, ..., 0.33]"]
@@ -420,6 +420,61 @@ A binary-quantized field (1 bit per dimension instead of 32):
 ```
 
 This reduces memory footprint roughly 32× at a measured accuracy cost — appropriate for very large vector corpora.
+
+### Text-to-vector inside Solr: the `language-models` module (Solr 9.8+)
+
+Everything above assumes *you* produce the vectors: your application calls an embedding API, gets floats back, and ships them to Solr in the `embedding` field. Through Solr 9.7 that was the only option. Since Solr 9.8, the **`language-models` module** (named `llm` in the 9.8/9.9 releases, renamed in 10.0) closes the loop: Solr itself calls an external embedding service — OpenAI, Cohere, Hugging Face, or Mistral AI, via [LangChain4j](https://github.com/langchain4j/langchain4j) — to vectorise document fields at index time and query text at query time. End-to-end semantic search with no embedding code in your application.
+
+> **Read the warning label first.** This module sends your document content and user queries to a hosted service on the internet. The reference guide is blunt about the cost, privacy, performance, and availability implications — and about indexing speed: a synchronous HTTP call per document "will slow down substantially your indexing pipeline." Stress-test before going live, and use the two-pass pattern below for bulk loads.
+
+Three moving parts, all of which the companion code exercises against a stub embedding service:
+
+**1. Enable the module and register the plugins** (`solrconfig.xml`). The module ships with Solr; enable it with `SOLR_MODULES=language-models`, then declare the query parser and (for index-time vectorisation) an update-processor chain:
+
+```xml
+<queryParser name="knn_text_to_vector"
+             class="org.apache.solr.languagemodels.textvectorisation.search.TextToVectorQParserPlugin"/>
+
+<updateRequestProcessorChain name="textToVector">
+  <processor class="solr.languagemodels.textvectorisation.update.processor.TextToVectorUpdateProcessorFactory">
+    <str name="inputField">description</str>
+    <str name="outputField">embedding</str>
+    <str name="model">openai-embed</str>
+  </processor>
+  <processor class="solr.RunUpdateProcessorFactory"/>
+</updateRequestProcessorChain>
+```
+
+**2. Upload a model.** A "model" in this module is not weights — it's a named reference to an external API: which provider class, which endpoint, which credentials. It lives in a managed model store, uploaded with a PUT (the same managed-resource pattern as LTR's stores in §5.4):
+
+```bash
+curl -XPUT 'http://localhost:8983/solr/shows/schema/text-to-vector-model-store' \
+  -H 'Content-type:application/json' --data-binary '{
+  "class": "dev.langchain4j.model.openai.OpenAiEmbeddingModel",
+  "name": "openai-embed",
+  "params": {
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKey": "sk-...",
+    "modelName": "text-embedding-3-small",
+    "timeout": 60,
+    "maxRetries": 5
+  }
+}'
+```
+
+The supported classes are `OpenAiEmbeddingModel`, `CohereEmbeddingModel`, `HuggingFaceEmbeddingModel`, and `MistralAiEmbeddingModel`; `params` passes through to the underlying LangChain4j builder, so anything that exposes an OpenAI-compatible endpoint (including a locally hosted inference server) works via `baseUrl`.
+
+**3. Query with `knn_text_to_vector`.** Same shape as `{!knn}`, but the body is *text*, not a vector — Solr embeds it for you with the named model and runs the HNSW search:
+
+```text
+q={!knn_text_to_vector model=openai-embed f=embedding topK=10}dark sci-fi thriller about memory and identity
+```
+
+> **Production tip — bulk-load first, vectorise second.** Don't put the vectorisation processor in your default chain: one slow embedding call per document couples your ingest throughput to a third-party API. The reference guide's recommended pattern is two chains — a fast `no-vectorisation` chain for the bulk load, then a second pass that targets a `vectorisation` chain via *atomic updates* (`{"id":"...", "vectorised":{"set":true}}`), letting Solr reconstruct each document and fill the vector field. Track progress by faceting on the `vectorised` flag. If you use partial updates this way, place `TextToVectorUpdateProcessorFactory` *after* `DistributedUpdateProcessorFactory` in the chain so it sees the reconstructed full document.
+
+> **Solr 9 difference — module name.** In Solr 9.8/9.9 the module is `llm` (`SOLR_MODULES=llm`) and the classes live under `org.apache.solr.llm.*`; Solr 10 renamed both to `language-models` / `org.apache.solr.languagemodels.*`. The model store and query-parser syntax are the same.
+
+The companion code's `TextToVectorIntegrationTest` runs this whole lifecycle — module enablement, plugin registration via the Config API, model upload, URP-driven indexing, `knn_text_to_vector` query — against a Testcontainers Solr, with a local stub standing in for the OpenAI endpoint so the test is hermetic.
 
 ### Hybrid search: combining keyword + vector
 
@@ -819,6 +874,7 @@ A mature autocomplete UX runs **both**: SuggestComponent on `/suggest` returns a
 - BM25 is the default similarity (since Solr 6); tune `k1` and `b` only with measured relevance metrics in hand.
 - The JSON Facet API (Solr 5+) is the modern way to compute facets and sub-aggregations.
 - Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser; tune `topK` and `efSearchScaleFactor`.
+- Since Solr 9.8, the `language-models` module embeds text *inside* Solr — `knn_text_to_vector` at query time, `TextToVectorUpdateProcessorFactory` at index time — via OpenAI/Cohere/HuggingFace/Mistral. Mind the privacy and ingest-throughput warnings; bulk-load first, vectorise second.
 - For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** (SOLR-17319, fix versions 10.1 and 9.11).
 
 ---

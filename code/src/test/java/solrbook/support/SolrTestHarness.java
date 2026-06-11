@@ -20,16 +20,37 @@ public final class SolrTestHarness {
   public static final String IMAGE = System.getProperty("solr.image", "solr:10.0.0");
   public static final String SHOWS = "shows";
 
+  /**
+   * A host port reserved for stub services the container must reach back into (the
+   * OpenAI-compatible embedding stub in the text-to-vector test). Exposed to the
+   * container as {@code host.testcontainers.internal:<port>} — which only works when
+   * registered before the container starts, hence the harness owns it.
+   */
+  public static final int HOST_STUB_PORT = reservePort();
+
   private static final SolrContainer CONTAINER =
-      new SolrContainer(DockerImageName.parse(IMAGE)).withCollection(SHOWS);
+      new SolrContainer(DockerImageName.parse(IMAGE))
+          .withCollection(SHOWS)
+          // §3.6: the text-to-vector capability ships as the language-models module
+          // (named "llm" in Solr 9.8/9.9).
+          .withEnv("SOLR_MODULES", "language-models");
 
   private static SolrClient client;
   private static boolean showsReady;
 
   private SolrTestHarness() {}
 
+  private static int reservePort() {
+    try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
+      return socket.getLocalPort();
+    } catch (java.io.IOException e) {
+      throw new IllegalStateException("could not reserve a host port for stub services", e);
+    }
+  }
+
   public static synchronized SolrClient client() {
     if (client == null) {
+      org.testcontainers.Testcontainers.exposeHostPorts(HOST_STUB_PORT);
       CONTAINER.start();
       String baseUrl =
           "http://" + CONTAINER.getHost() + ":" + CONTAINER.getSolrPort() + "/solr";

@@ -35,6 +35,10 @@ dependencies {
     testImplementation(platform("org.testcontainers:testcontainers-bom:$testcontainersVersion"))
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:solr")
+
+    // The OpenAI-compatible embedding stub builds JSON with Jackson, which SolrJ only
+    // exposes at runtime.
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.20.0")
 }
 
 tasks.withType<Test>().configureEach {

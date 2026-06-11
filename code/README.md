@@ -31,6 +31,7 @@ The integration tests pull the Docker Official Image `solr:10.0.0` on first run.
 | `solrbook.search.FacetSearch` | §3.3, §5.5 | JSON Facet API requests; `relatedness()` semantic knowledge graph |
 | `solrbook.search.KnnSearch` | §3.6 | `{!knn}` vector queries and the `{!rerank}` hybrid pattern |
 | `solrbook.search.Rrf` | §3.6 | Client-side Reciprocal Rank Fusion (until native RRF in Solr 10.1) |
+| `solrbook.search.TextToVector` | §3.6 | The `language-models` module lifecycle: parser/URP registration, model store upload, `knn_text_to_vector` queries |
 | `solrbook.search.CollapseSearch` | §3.9 | Collapse + Expand, one row per franchise |
 | `solrbook.relevance.Ndcg` | §5.1 | NDCG@k exactly as derived in the book |
 | `solrbook.relevance.SignalsWeights` | §5.2 | Signals aggregation pass 2: log-dampened, per-query-normalized weights |
@@ -45,8 +46,10 @@ The integration tests pull the Docker Official Image `solr:10.0.0` on first run.
   real Solr 10 in Docker (one shared container for the whole suite), build the schema via
   the Schema API, index the seed catalog, and exercise: eDisMax relevance, JSON facets,
   collapse/expand, `relatedness()`, atomic vs. in-place updates, optimistic-concurrency
-  409s, cursorMark reindex + alias swap, `{!knn}` vector search, hybrid rerank, and
-  client-side RRF.
+  409s, cursorMark reindex + alias swap, `{!knn}` vector search, hybrid rerank,
+  client-side RRF, and the full `language-models` text-to-vector lifecycle (the
+  container runs with `SOLR_MODULES=language-models`, and a local OpenAI-compatible
+  stub stands in for the embedding service so the test is hermetic).
 
 CI runs both suites on every push that touches `code/` (see
 `.github/workflows/code-ci.yml`).
