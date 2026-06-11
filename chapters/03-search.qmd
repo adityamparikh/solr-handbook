@@ -476,6 +476,24 @@ q={!knn_text_to_vector model=openai-embed f=embedding topK=10}dark sci-fi thrill
 
 The companion code's `TextToVectorIntegrationTest` runs this whole lifecycle — module enablement, plugin registration via the Config API, model upload, URP-driven indexing, `knn_text_to_vector` query — against a Testcontainers Solr, with a local stub standing in for the OpenAI endpoint so the test is hermetic.
 
+### Who should own the embedding: your application, or Solr?
+
+With the module in the picture, every team building vector search on Solr now has a genuine architectural choice. Both paths produce the same `DenseVectorField` and the same HNSW search; they differ in who calls the embedding service, and therefore in who controls the failure modes:
+
+| | Application-side (Spring AI, LangChain4j, raw HTTP) | Solr-side (`language-models` module) |
+|---|---|---|
+| **Code you write** | An embedding client, batching, retries — and you ship vectors in the document | None beyond config: parser + URP + model store |
+| **Ingest coupling** | Decoupled — embed offline, in bulk, at your own pace | Synchronous HTTP call inside the update chain (or the two-pass atomic-update pattern above) |
+| **Batching & cost control** | Full: batch sizes, caching, dedup, provider failover | Per-document calls; retries via the model's `maxRetries` |
+| **Backfill / re-embedding** | A batch job you already own | Atomic-update second pass, tracked with a `vectorised` flag |
+| **API credentials live in** | Your application's secret store | Solr's model store (readable by anyone with `config-read`/security access) |
+| **Query-time** | You embed the query text, then `{!knn}` | `{!knn_text_to_vector}` — Solr embeds it |
+| **Choose it when** | Production pipelines at scale; you need cost/latency control or a provider Solr doesn't support | Prototypes, small corpora, teams that want zero embedding code, query-time-only embedding |
+
+A reasonable default: **let Solr embed queries** (`knn_text_to_vector` — one short string per search, latency-tolerable, no app code) **and let your application embed documents** (where batching and backfill control matter). Mixing the two is fine as long as both sides use the *same model* — vectors from different models live in incomparable spaces, and the symptom is silently terrible recall, not an error.
+
+For a complete, working application-side implementation in this book's stack — Spring Boot and Spring AI with a custom Solr `VectorStore`, automatic embedding at index time, LLM-generated Solr queries from natural language, and application-layer RRF over keyword + vector results — see the author's companion application [`ai-powered-search`](https://github.com/adityamparikh/ai-powered-search). (At the time of writing it targets Solr 9.10/SolrJ 9.10; the SolrJ 10 differences in Appendix A apply when porting its patterns.)
+
 ### Hybrid search: combining keyword + vector
 
 The two ranked lists you've now produced — BM25 results and KNN results — answer different questions and have **incomparable score scales**. A BM25 score of 12.5 means nothing in isolation; a cosine score of 0.92 is on `[-1, 1]`. You cannot just average them or take a weighted sum without first re-scaling, and re-scaling is fragile across queries.
