@@ -7,6 +7,8 @@
 > **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search and HNSW work, with a worked cosine-similarity example; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
 >
 > **What you should not skip:** §3.5 (BM25 in honest detail) and §3.6 (vector search and hybrid retrieval — the future of every search bar).
+>
+> **Companion code:** the eDisMax query, JSON facets, `{!knn}` vector search, the rerank hybrid, client-side RRF (reproducing this chapter's worked table in a unit test), and collapse/expand all run against a real Solr 10 in [`code/src/main/java/solrbook/search/`](https://github.com/adityamparikh/solr-handbook/tree/main/code).
 
 ## 3.1 Query anatomy
 
@@ -55,7 +57,7 @@ sequenceDiagram
 
 ### Why eDisMax wins for production
 
-eDisMax adds: support for full Lucene syntax inside the `q` string (so power users can do `platforms:Netflix`), proper escaping of bad input, phrase boosts on bigrams/trigrams (`pf2`, `pf3`), boost queries, and multiplicative boost functions.
+eDisMax adds: support for full Lucene syntax inside the `q` string (so power users can do `platforms:Netflix`), proper escaping of bad input, phrase boosts on bigrams/trigrams (`pf2`, `pf3`), and the multiplicative `boost` function (`bq`/`bf` boost queries already exist in plain DisMax).
 
 Key eDisMax params:
 
@@ -65,7 +67,7 @@ Key eDisMax params:
 | `pf` | Phrase boost: if the full query appears as a phrase in these fields, boost it |
 | `pf2`, `pf3` | Phrase boost on bigrams / trigrams |
 | `ps`, `ps2`, `ps3` | Phrase slop (positions allowed between phrase tokens) |
-| `mm` | Minimum should match: `mm=2<-1 5<80%` ("for queries up to 2 terms all must match; for 5+ terms at least 80%") |
+| `mm` | Minimum should match: `mm=2<-1 5<80%` ("up to 2 terms all must match; 3–5 terms all but one; 6+ terms at least 80%" — each conditional applies to queries with *more* terms than its threshold) |
 | `tie` | Tie-breaker between dismax (`0.0`) and sum (`1.0`); typically `0.1` |
 | `bq` | Additive boost query: `bq=status:ongoing^5` |
 | `boost` | Multiplicative boost function |
@@ -98,7 +100,7 @@ The `boost=recip(...)` clause multiplies the score by a value that decays with d
 ### SolrJ equivalent
 
 ```java
-import org.apache.solr.client.solrj.SolrQuery;
+import org.apache.solr.client.solrj.request.SolrQuery;   // moved to .request in SolrJ 10
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrDocumentList;
 
@@ -128,7 +130,7 @@ SolrDocumentList docs = resp.getResults();
 Solr exposes faceting in three ways:
 
 1. **Legacy field/range/query/pivot facets** via `facet.*` params. Simple, flat.
-2. **JSON Facet API** (recommended). Nested, composable, supports aggregations like `avg`, `percentile`, `unique`. Introduced in Solr 6.0, per Yonik Seeley's original announcement on yonik.com (April 17, 2015): *"Solr 5 has a completely re-written faceted search and analytics module with a structured JSON API."*
+2. **JSON Facet API** (recommended). Nested, composable, supports aggregations like `avg`, `percentile`, `unique`. First shipped in Solr 5.1, per Yonik Seeley's original announcement on yonik.com (April 17, 2015): *"Solr 5 has a completely re-written faceted search and analytics module with a structured JSON API."*
 3. **Pivot facets** for hierarchical multi-field facets (the JSON API supersedes most uses).
 
 ### Legacy field facet
@@ -213,9 +215,9 @@ The execution costs of each of these are covered in detail in §1.4. The short v
 
 ## 3.5 Relevance scoring — BM25 in honest detail
 
-Solr 10 ships **BM25Similarity** as the default. BM25 became the default similarity in Solr 5.0.0 (SOLR-8270/SOLR-8271): *"SchemaSimilarityFactory has been modified to use BM25Similarity as the default for fieldTypes that do not explicitly declare a Similarity. The legacy behavior of using ClassicSimilarity as the default will occur if the luceneMatchVersion for the collection is less than 5.0."* TF-IDF (`ClassicSimilarity`) survives but is legacy.
+Solr 10 ships **BM25Similarity** as the default. BM25 became the default similarity in Solr 6.0.0 (SOLR-8261/SOLR-8329; the Lucene-side switch was LUCENE-6789). The Solr 6.0 upgrade notes read: *"SchemaSimilarityFactory has been modified to use BM25Similarity as the default for fieldTypes that do not explicitly declare a Similarity. The legacy behavior of using ClassicSimilarity as the default will occur if the luceneMatchVersion for the collection is less than 6.0."* TF-IDF (`ClassicSimilarity`) survives but is legacy.
 
-The Lucene Javadoc for `BM25SimilarityFactory` defines the parameters explicitly: *"k1 (float): Controls non-linear term frequency normalization (saturation). The default is 1.2 · b (float): Controls to what degree document length normalizes tf values. The default is 0.75."*
+The Solr Javadoc for `BM25SimilarityFactory` defines the parameters explicitly: *"k1 (float): Controls non-linear term frequency normalization (saturation). The default is 1.2 · b (float): Controls to what degree document length normalizes tf values. The default is 0.75."*
 
 ### The BM25 formula
 
@@ -285,7 +287,7 @@ Before walking into the vector mechanics, it helps to see how lexical and vector
 flowchart TB
     DOC["DOCUMENT<br/>'Apache Solr powers fast scalable search'"]
     DOC --> TXT["TEXT ANALYSIS<br/>(Lucene analyzer chain)"]
-    DOC --> EMB["EMBEDDING MODEL<br/>(external API call,<br/>e.g. OpenAI text-embedding-3-small)"]
+    DOC --> EMB["EMBEDDING MODEL<br/>(external service, called by your app —<br/>or by Solr itself via the<br/>language-models module)"]
 
     TXT --> TOK["Tokens:<br/>apach, solr, power,<br/>fast, scalabl, search"]
     EMB --> VEC["Vector: 384 or 1536 floats<br/>[0.12, -0.45, 0.78, ..., 0.33]"]
@@ -311,7 +313,7 @@ That syntax says: "find the top-20 nearest neighbors of the given query vector i
 
 ### HNSW: how the graph walk actually works
 
-HNSW is a **layered proximity graph**. Every vector you index becomes a node. Edges connect each node to its approximate nearest neighbors (up to `M = hnswMaxConnections`, default 16). The trick: not every node lives on every layer. A small fraction of nodes are randomly promoted to higher layers, where they form a sparser graph with longer edges. The top layer has only a handful of nodes; the bottom layer (layer 0) has every node.
+HNSW is a **layered proximity graph**. Every vector you index becomes a node. Edges connect each node to its approximate nearest neighbors (up to `M = hnswM`, default 16; this schema attribute was named `hnswMaxConnections` in Solr 9.x and was renamed — along with `hnswBeamWidth` → `hnswEfConstruction` — in Solr 10). The trick: not every node lives on every layer. A small fraction of nodes are randomly promoted to higher layers, where they form a sparser graph with longer edges. The top layer has only a handful of nodes; the bottom layer (layer 0) has every node.
 
 ```{mermaid}
 %%| label: fig-03-hnsw-graph-walk
@@ -353,7 +355,7 @@ The walk has two phases — a greedy descent through the upper layers, then a wi
 2. **Greedy step:** look at all neighbors of the current node. If any neighbor is closer to the query than the current node, move to the closest one. Repeat until no neighbor improves distance. This finds the local minimum on this layer.
 3. **Descend** to the next layer, using the local minimum as the entry point.
 4. **Repeat** until you reach layer 0.
-5. **At layer 0**, do an exhaustive search of a candidate pool of size `efSearch` (default = `topK`). Return the `topK` closest from that pool.
+5. **At layer 0**, do an exhaustive search of a candidate pool of size efSearch = `efSearchScaleFactor × topK` (the scale factor defaults to 1.0 and is new in Solr 10, SOLR-17928). Return the `topK` closest from that pool.
 
 Why this is fast: each layer halves the search space. The top layers do long jumps over the vector space, like the express lanes of a skip list; the bottom layer does fine-grained local refinement. Visiting ~20 nodes out of 15,000 vectors is typical, vs. 15,000 brute-force distance computations.
 
@@ -407,7 +409,7 @@ For the underlying math, see the [Wikipedia article on cosine similarity](https:
 
 ### What's new in Solr 10 for vectors
 
-The Solr 10.0 reference guide explicitly lists, as new features: *"Scalar and binary quantized dense vectors are now supported for DenseVectorField (SOLR-17780, SOLR-17812). Quantization reduces memory consumption and can improve search performance at some cost to accuracy."* And: *"GPU-accelerated approximate nearest neighbor search is now available via the cuVS-Lucene pluggable codec (SOLR-17892)."*
+The Solr 10.0 release notes explicitly list, as new features: *"Scalar and binary quantized dense vectors are now supported for DenseVectorField (SOLR-17780, SOLR-17812). Quantization reduces memory consumption and can improve search performance at some cost to accuracy."* And: *"GPU-accelerated approximate nearest neighbor search is now available via the cuVS-Lucene pluggable codec (SOLR-17892)."*
 
 A binary-quantized field (1 bit per dimension instead of 32):
 
@@ -418,6 +420,79 @@ A binary-quantized field (1 bit per dimension instead of 32):
 ```
 
 This reduces memory footprint roughly 32× at a measured accuracy cost — appropriate for very large vector corpora.
+
+### Text-to-vector inside Solr: the `language-models` module (Solr 9.8+)
+
+Everything above assumes *you* produce the vectors: your application calls an embedding API, gets floats back, and ships them to Solr in the `embedding` field. Through Solr 9.7 that was the only option. Since Solr 9.8, the **`language-models` module** (named `llm` in the 9.8/9.9 releases, renamed in 10.0) closes the loop: Solr itself calls an external embedding service — OpenAI, Cohere, Hugging Face, or Mistral AI, via [LangChain4j](https://github.com/langchain4j/langchain4j) — to vectorise document fields at index time and query text at query time. End-to-end semantic search with no embedding code in your application.
+
+> **Read the warning label first.** This module sends your document content and user queries to a hosted service on the internet. The reference guide is blunt about the cost, privacy, performance, and availability implications — and about indexing speed: a synchronous HTTP call per document "will slow down substantially your indexing pipeline." Stress-test before going live, and use the two-pass pattern below for bulk loads.
+
+Three moving parts, all of which the companion code exercises against a stub embedding service:
+
+**1. Enable the module and register the plugins** (`solrconfig.xml`). The module ships with Solr; enable it with `SOLR_MODULES=language-models`, then declare the query parser and (for index-time vectorisation) an update-processor chain:
+
+```xml
+<queryParser name="knn_text_to_vector"
+             class="org.apache.solr.languagemodels.textvectorisation.search.TextToVectorQParserPlugin"/>
+
+<updateRequestProcessorChain name="textToVector">
+  <processor class="solr.languagemodels.textvectorisation.update.processor.TextToVectorUpdateProcessorFactory">
+    <str name="inputField">description</str>
+    <str name="outputField">embedding</str>
+    <str name="model">openai-embed</str>
+  </processor>
+  <processor class="solr.RunUpdateProcessorFactory"/>
+</updateRequestProcessorChain>
+```
+
+**2. Upload a model.** A "model" in this module is not weights — it's a named reference to an external API: which provider class, which endpoint, which credentials. It lives in a managed model store, uploaded with a PUT (the same managed-resource pattern as LTR's stores in §5.4):
+
+```bash
+curl -XPUT 'http://localhost:8983/solr/shows/schema/text-to-vector-model-store' \
+  -H 'Content-type:application/json' --data-binary '{
+  "class": "dev.langchain4j.model.openai.OpenAiEmbeddingModel",
+  "name": "openai-embed",
+  "params": {
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKey": "sk-...",
+    "modelName": "text-embedding-3-small",
+    "timeout": 60,
+    "maxRetries": 5
+  }
+}'
+```
+
+The supported classes are `OpenAiEmbeddingModel`, `CohereEmbeddingModel`, `HuggingFaceEmbeddingModel`, and `MistralAiEmbeddingModel`; `params` passes through to the underlying LangChain4j builder, so anything that exposes an OpenAI-compatible endpoint (including a locally hosted inference server) works via `baseUrl`.
+
+**3. Query with `knn_text_to_vector`.** Same shape as `{!knn}`, but the body is *text*, not a vector — Solr embeds it for you with the named model and runs the HNSW search:
+
+```text
+q={!knn_text_to_vector model=openai-embed f=embedding topK=10}dark sci-fi thriller about memory and identity
+```
+
+> **Production tip — bulk-load first, vectorise second.** Don't put the vectorisation processor in your default chain: one slow embedding call per document couples your ingest throughput to a third-party API. The reference guide's recommended pattern is two chains — a fast `no-vectorisation` chain for the bulk load, then a second pass that targets a `vectorisation` chain via *atomic updates* (`{"id":"...", "vectorised":{"set":true}}`), letting Solr reconstruct each document and fill the vector field. Track progress by faceting on the `vectorised` flag. If you use partial updates this way, place `TextToVectorUpdateProcessorFactory` *after* `DistributedUpdateProcessorFactory` in the chain so it sees the reconstructed full document.
+
+> **Solr 9 difference — module name.** In Solr 9.8/9.9 the module is `llm` (`SOLR_MODULES=llm`) and the classes live under `org.apache.solr.llm.*`; Solr 10 renamed both to `language-models` / `org.apache.solr.languagemodels.*`. The model store and query-parser syntax are the same.
+
+The companion code's `TextToVectorIntegrationTest` runs this whole lifecycle — module enablement, plugin registration via the Config API, model upload, URP-driven indexing, `knn_text_to_vector` query — against a Testcontainers Solr, with a local stub standing in for the OpenAI endpoint so the test is hermetic.
+
+### Who should own the embedding: your application, or Solr?
+
+With the module in the picture, every team building vector search on Solr now has a genuine architectural choice. Both paths produce the same `DenseVectorField` and the same HNSW search; they differ in who calls the embedding service, and therefore in who controls the failure modes:
+
+| | Application-side (Spring AI, LangChain4j, raw HTTP) | Solr-side (`language-models` module) |
+|---|---|---|
+| **Code you write** | An embedding client, batching, retries — and you ship vectors in the document | None beyond config: parser + URP + model store |
+| **Ingest coupling** | Decoupled — embed offline, in bulk, at your own pace | Synchronous HTTP call inside the update chain (or the two-pass atomic-update pattern above) |
+| **Batching & cost control** | Full: batch sizes, caching, dedup, provider failover | Per-document calls; retries via the model's `maxRetries` |
+| **Backfill / re-embedding** | A batch job you already own | Atomic-update second pass, tracked with a `vectorised` flag |
+| **API credentials live in** | Your application's secret store | Solr's model store (readable by anyone with `config-read`/security access) |
+| **Query-time** | You embed the query text, then `{!knn}` | `{!knn_text_to_vector}` — Solr embeds it |
+| **Choose it when** | Production pipelines at scale; you need cost/latency control or a provider Solr doesn't support | Prototypes, small corpora, teams that want zero embedding code, query-time-only embedding |
+
+A reasonable default: **let Solr embed queries** (`knn_text_to_vector` — one short string per search, latency-tolerable, no app code) **and let your application embed documents** (where batching and backfill control matter). Mixing the two is fine as long as both sides use the *same model* — vectors from different models live in incomparable spaces, and the symptom is silently terrible recall, not an error.
+
+For a complete, working application-side implementation in this book's stack — Spring Boot and Spring AI with a custom Solr `VectorStore`, automatic embedding at index time, LLM-generated Solr queries from natural language, and application-layer RRF over keyword + vector results — see the author's companion application [`ai-powered-search`](https://github.com/adityamparikh/ai-powered-search). (At the time of writing it targets Solr 9.10/SolrJ 9.10; the SolrJ 10 differences in Appendix A apply when porting its patterns.)
 
 ### Hybrid search: combining keyword + vector
 
@@ -476,7 +551,7 @@ The raw scores live on totally different scales — BM25 is unbounded positive, 
 
 | Document | BM25 rank | KNN rank | RRF calculation | RRF score |
 |---|---|---|---|---|
-| `MH-001` | 1 | 2 | `1/(60+1) + 1/(60+2)` | **0.03253** |
+| `MH-001` | 1 | 2 | `1/(60+1) + 1/(60+2)` | **0.03252** |
 | `BB-001` | 2 | 4 | `1/(60+2) + 1/(60+4)` | **0.03175** |
 | `BM-001` | 3 | 3 | `1/(60+3) + 1/(60+3)` | **0.03175** |
 | `SVR-001` | — | 1 | `0 + 1/(60+1)` | **0.01639** |
@@ -487,7 +562,7 @@ Sorted final ranking:
 
 1. `MH-001` (Mindhunter) — strong in **both** lists. Wins decisively despite not being a sci-fi show, because both retrievers agree on its "dark psychological" character.
 2. `BB-001` (Breaking Bad) — good in both. Second. Same kind of cross-retriever agreement.
-3. `BM-001` (Black Mirror) — good in both, tied with `BB-001`.
+3. `BM-001` (Black Mirror) — good in both, tied with `BB-001` at the displayed precision (`BB-001` is higher by about 8×10⁻⁶).
 4. `WW-001` (Westworld) — present in both but ranked lower; still beats the vector-only hit.
 5. `SVR-001` (Severance) — vector-only hit. A pure semantic match the keyword retriever missed because the query didn't share many lexical tokens with the synopsis. **This is exactly what RRF protects against** in pure-BM25 systems: semantic matches that have no keyword overlap.
 
@@ -547,7 +622,7 @@ resp.getSpellCheckResponse().getCollatedResults();    // returns "stranger thing
 &hl=true&hl.fl=title,description&hl.fragsize=160&hl.tag.pre=<mark>&hl.tag.post=</mark>
 ```
 
-Returns matched snippets per doc with HTML markers around hit terms. Use the unified highlighter (`hl.method=unified`) for performance on long fields with positions+offsets indexed.
+Returns matched snippets per doc with HTML markers around hit terms. The unified highlighter (`hl.method=unified`) is the default in Solr 10; for long fields, index with `storeOffsetsWithPositions="true"` to keep it fast.
 
 ## 3.9 Result grouping with the Collapse query parser
 
@@ -564,18 +639,20 @@ For this example, assume the schema has been extended with a `franchise_id` fiel
 
 ```text
 q=star wars
-&fq={!collapse field=franchise_id max=rating}
+&fq={!collapse field=franchise_id max=rating nullPolicy=expand}
 &expand=true
 &expand.rows=4
 &fl=id,title,rating,franchise_id
 ```
+
+> **Gotcha — `nullPolicy`.** The default (`nullPolicy=ignore`) drops every document that has *no* value in the collapse field from the results entirely, and `nullPolicy=collapse` merges all of them into a single group — both surprising when only some documents carry `franchise_id`. For a sparsely-populated collapse field like this one, `nullPolicy=expand` (each null document is its own group) is almost always what you want.
 
 From SolrJ:
 
 ```java
 SolrQuery q = new SolrQuery(userQuery)
     .setRequestHandler("/select")
-    .addFilterQuery("{!collapse field=franchise_id max=rating}")
+    .addFilterQuery("{!collapse field=franchise_id max=rating nullPolicy=expand}")
     .setFields("id,title,rating,franchise_id");
 q.set("expand", "true");
 q.set("expand.rows", "4");
@@ -590,7 +667,8 @@ uniqueKey:        id
 schema:           <uniqueKey>id</uniqueKey>
 indexed id value: "STAR-WARS!TM-001"
                    └─prefix──┘ └suffix─┘
-routing:          murmur3("STAR-WARS") % shardCount
+routing:          MurmurHash3("STAR-WARS") → upper bits of the 32-bit hash,
+                  mapped to the shard whose hash range contains it
 ```
 
 The string before the `!` in the `id` is hashed; everything after the `!` is part of the unique identifier but ignored for routing. So `STAR-WARS!TM-001`, `STAR-WARS!LK-001`, and `STAR-WARS!AND-001` all land on the same shard. The collapse field (`franchise_id` in the example) is a **separate** field whose value matches the prefix (`"STAR-WARS"`) — you'd set both at index time.
@@ -721,7 +799,6 @@ try (var client = new CloudSolrClient.Builder(
     ModifiableSolrParams build = new ModifiableSolrParams();
     build.set("qt", "/suggest");
     build.set("suggest.buildAll", "true");
-    build.set("distrib", "true");                  // fan out to every shard
     var buildReq = new QueryRequest(build);
     buildReq.setPath("/suggest");
     client.request(buildReq);
@@ -744,7 +821,7 @@ try (var client = new CloudSolrClient.Builder(
 
 > **Production tip — never `buildOnCommit=true`.** A rebuild on every soft commit will starve query traffic under any non-trivial write load. Build on a schedule (cron / Kubernetes `CronJob`) at whatever cadence matches your dictionary churn.
 
-> **Production tip — build every shard.** In SolrCloud the suggester data structure is per-replica. After a build, suggestions reflect only the replicas you built. Pass `distrib=true` (as above) or fan out explicitly.
+> **Production tip — build every replica.** In SolrCloud the suggester data structure is per-replica, and a distributed request reaches only *one replica per shard* — so a single build request leaves other replicas serving stale (or empty) suggestions. Build on every replica: iterate the replica core URLs from cluster state and issue the build against each, or use `buildOnStartup=true` for small dictionaries.
 
 Further detail — alternative lookup implementations (`BlendedInfix`, `Fuzzy`, `FST`), `suggest.cfq` context filtering, expression-based weights — is in the [Solr Suggester reference](https://solr.apache.org/guide/solr/latest/query-guide/suggester.html).
 
@@ -814,7 +891,8 @@ A mature autocomplete UX runs **both**: SuggestComponent on `/suggest` returns a
 - Default to **eDisMax** for any user-facing search. Master `qf`, `pf`, `mm`, `tie`, `bq`, `boost`.
 - BM25 is the default similarity (since Solr 6); tune `k1` and `b` only with measured relevance metrics in hand.
 - The JSON Facet API (Solr 5+) is the modern way to compute facets and sub-aggregations.
-- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser, tune `efSearch`.
+- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser; tune `topK` and `efSearchScaleFactor`.
+- Since Solr 9.8, the `language-models` module embeds text *inside* Solr — `knn_text_to_vector` at query time, `TextToVectorUpdateProcessorFactory` at index time — via OpenAI/Cohere/HuggingFace/Mistral. Mind the privacy and ingest-throughput warnings; bulk-load first, vectorise second.
 - For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** (SOLR-17319, fix versions 10.1 and 9.11).
 
 ---

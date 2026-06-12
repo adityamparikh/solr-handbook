@@ -1,0 +1,41 @@
+# Appendix A — Upgrading from Solr 9 to 10 {.unnumbered}
+
+The "Solr 9 difference" callouts are scattered through the chapters where each topic lives. This appendix consolidates them into one pass-through checklist. It is a *map*, not the territory: before any production upgrade, read the official [Major Changes in Solr 10](https://solr.apache.org/guide/solr/latest/upgrade-notes/major-changes-in-solr-10.html) page and the upgrade notes for every 9.x minor between your version and 9.10.
+
+## Before you start
+
+- [ ] **Upgrade to the latest 9.x first.** Lucene only reads the current and previous major version's index format (§2.9.1) — an index last written by Solr 8 segments cannot be opened by Solr 10. If any segment predates 9.x, plan a **full reindex** (§2.9.3, blue/green alias swap) rather than an in-place upgrade.
+- [ ] **Know the 9.10 version gate.** Starting in 9.10, SolrCloud nodes refuse to start if their `major.minor` version is *lower* than the highest version present in the cluster. Once the first 10.0 node joins, you cannot roll a 9.x node back into the cluster — sequence your rolling upgrade (and your rollback plan) around that.
+- [ ] **Java 21 on every server node.** Solr 10 requires Java 21 (§4.1); Solr 9.x ran on Java 11+. Client applications using SolrJ 10 need Java 17.
+- [ ] **Check the Kubernetes operator.** The Apache Solr Operator's released versions list "Solr 9.4+" compatibility; verify the operator's Solr 10 support status before upgrading operator-managed clusters (§4.12).
+
+## Server-side changes that break scripts and configs
+
+- [ ] **`bin/solr start` now defaults to SolrCloud.** Standalone needs `--user-managed`; the old `-c` cloud flag is gone from `start` (§2.0, §4.1).
+- [ ] **CLI flags changed.** `bin/solr create` takes `--shards` and `--replication-factor`; `-s` now means `--solr-url` (§2.1). Audit every script that shells out to `bin/solr`.
+- [ ] **`bin/solr delete` keeps configsets.** Pass `--delete-config` explicitly if you want the 9.x auto-delete behavior (§4.7).
+- [ ] **Metrics: Dropwizard → OpenTelemetry.** Metric names move from dot-delimited to snake_case and `/admin/metrics` defaults to Prometheus exposition format (§4.14). Existing dashboards and alerts will break; budget time to rebuild them.
+- [ ] **`/admin/mbeans` is gone.** Anything scraping it (including older tooling) needs to move to `/admin/metrics`.
+- [ ] **Jetty 12 / Jakarta EE 10.** Custom plugins touching servlet APIs need `javax.servlet.*` → `jakarta.servlet.*` package renames (§4.1).
+- [ ] **Removed modules:** `jaegertracer-configurator`, `analytics`, `hadoop-auth` (§4.1). The `llm` module is renamed `language-models`, and its classes move from `org.apache.solr.llm.*` to `org.apache.solr.languagemodels.*` (§3.6).
+
+## Schema and query changes
+
+- [ ] **HNSW attribute renames.** `hnswMaxConnections` → `hnswM` and `hnswBeamWidth` → `hnswEfConstruction` in every `DenseVectorField` type (§2.3, §3.6). Schemas using the old names must be updated.
+- [ ] **New vector capabilities to adopt deliberately:** scalar/binary quantized vector field types, `efSearchScaleFactor`, and the cuVS GPU codec are new in 10.0 (§3.6) — opt-in, nothing breaks if ignored.
+- [ ] **LTR cache declaration changed.** Solr 10 uses a dedicated `<featureVectorCache>` element instead of the 9.x generic `<cache name="QUERY_DOC_FV">` declaration (§5.4).
+- [ ] **Native RRF is *not* in 10.0.** It lands in 10.1 (and 9.11, SOLR-17319); keep the rerank pattern or client-side fusion until then (§3.6).
+
+## SolrJ client changes
+
+- [ ] **Add `solr-solrj-jetty`** (or switch to `HttpJdkSolrClient`). SOLR-17161 moved the Jetty clients out of `solr-solrj` into their own artifact, and the `-zookeeper`/`-streaming` modules became opt-in (SOLR-15730) (§2.6).
+- [ ] **`SolrQuery` moved** to `org.apache.solr.client.solrj.request`; the Jetty clients live in `org.apache.solr.client.solrj.jetty` (§2.6, §3.2).
+- [ ] **`ConcurrentUpdateHttp2SolrClient` → `ConcurrentUpdateJettySolrClient`** (SOLR-18005), whose builder now takes the `HttpJettySolrClient` to send through (§2.6).
+- [ ] **ZooKeeper-hosts `CloudSolrClient.Builder` constructor is deprecated** (SOLR-14070). Pass Solr base URLs; timeouts go on the internal client builder via `withInternalClientBuilder(...)` (§2.6).
+- [ ] **`CloudHttp2SolrClient.Builder` moved to `CloudSolrClient`** — prefer `CloudSolrClient.Builder` in new code (§2.6).
+
+## After the upgrade
+
+- [ ] **Re-verify relevance.** Run your NDCG regression suite (§5.1) against the upgraded cluster before swapping traffic — the Lucene 10.3 engine under Solr 10 can shift scoring subtly.
+- [ ] **Run the verification battery from §2.9.5** if you reindexed: document counts, top-N overlap on head queries, facet histograms, field coverage.
+- [ ] **Re-run the companion code's integration suite against your image:** `./gradlew integrationTest -Dsolr.image=<your-image>` exercises schema, indexing, partial updates, vectors, and security against any Solr image tag.

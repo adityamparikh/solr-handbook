@@ -1,0 +1,42 @@
+name: companion-code
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "code/**"
+      - ".github/workflows/code-ci.yml"
+  pull_request:
+    paths:
+      - "code/**"
+      - ".github/workflows/code-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and run unit tests
+        run: ./gradlew build
+
+      - name: Run Testcontainers integration tests (Solr 10)
+        run: ./gradlew integrationTest
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: code/build/reports/tests/

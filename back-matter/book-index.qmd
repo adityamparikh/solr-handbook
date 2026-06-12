@@ -31,9 +31,9 @@ The index is alphabetical by topic; bold entries point to the section where a co
 ### C
 
 - cache thrash from over-committing, §2.10
-- caches (`filterCache`, `queryResultCache`, `documentCache`), §4.13
+- caches (`filterCache`, `queryResultCache`, `documentCache`), §4.14
 - cardinality and faceting, §3.3
-- circuit breakers, §4.13
+- circuit breakers, §4.14
 - citation policy, *Preface — Conventions*
 - Claude Desktop (MCP client), **§6.5**, §6.6
 - Claude Code (MCP client), §6.6
@@ -150,7 +150,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - measurement (NDCG, MRR, MAP), **§5.1**
 - merging segments, **§2.11**
 - Mermaid, *Preface — Diagrams*
-- metrics (OpenTelemetry, Prometheus), §4.13
+- metrics (OpenTelemetry, Prometheus), §4.14
 - migration considerations (Solr ↔ ES/OS), §7.8
 - minimum-should-match (`mm`), §3.2
 - Model Context Protocol (MCP), **Chapter 6**; tool surface, **§6.3**; transport (STDIO vs HTTP), **§6.4**; quick start, **§6.5**; client integration, **§6.6**; ES and OpenSearch comparison, **§7.9**
@@ -169,7 +169,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - OAuth2 (for MCP HTTP mode), **§6.7**; Auth0, §6.7; Keycloak, §6.7
 - observability (LGTM stack for MCP), **§6.8**
 - OpenSearch, **Chapter 7**; Foundation (Linux Foundation), §7.1; MCP server, §7.9
-- OpenTelemetry metrics, §4.13; in MCP server, §6.8
+- OpenTelemetry metrics, §4.14; in MCP server, §6.8
 - optimistic concurrency (`_version_`), **§2.8.3**
 - optimize (forced merge), §2.11
 - overseer, §4.1; overseer-less mode (SOLR-17877), §4.1
@@ -208,6 +208,8 @@ The index is alphabetical by topic; bold entries point to the section where a co
 ### S
 
 - schema design, **§2.3**
+- security: Basic authentication, **§4.13**; JWT/OIDC (`jwt-auth` module), §4.13; in MCP server, §6.7
+- `security.json`, **§4.13**
 - seed dataset (the 30-show table), **§2.3**
 - segment, Lucene, **§1.3**, §2.11
 - semantic knowledge graph — see *`relatedness()` aggregation*
@@ -222,6 +224,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - signals collection, **§5.2**
 - signals boosting, **§5.3**
 - similarity (per-field override), §3.5
+- SSL/TLS (`SOLR_SSL_*`), §4.13
 - soft commit, **§2.10**
 - SolrCloud, **Chapter 4**; default in Solr 10, §4.1
 - SolrJ (Maven coordinates, artifacts), §2.6

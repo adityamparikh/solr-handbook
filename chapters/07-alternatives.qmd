@@ -25,7 +25,7 @@ flowchart TB
 
 The key dates:
 
-- **January 2021** — Elastic relicensed Elasticsearch and Kibana from Apache 2.0 to dual SSPL/Elastic License v2 to block AWS from offering a managed service. The Open Source Initiative does not consider either license open-source.
+- **January 2021** — Elastic announced the relicensing of Elasticsearch and Kibana away from Apache 2.0 to block AWS from offering a managed service; the change took effect with Elasticsearch 7.11 (February 2021) under dual SSPL/Elastic License 2.0 (ELv2 itself was published in February 2021). The Open Source Initiative does not consider either license open-source.
 - **April 2021** — AWS forked the last Apache 2.0 commit and called it **OpenSearch**, with Kibana → OpenSearch Dashboards.
 - **August 29, 2024** — Elastic added the **GNU AGPLv3** (an OSI-approved open-source license) as a third option for Elasticsearch and Kibana source. As Elastic CTO Shay Banon wrote: *"Elasticsearch and Kibana can be called Open Source again."*
 - **September 16, 2024** — AWS transferred OpenSearch to the **Linux Foundation**. Per the Linux Foundation press release: *"The OpenSearch Software Foundation launches with support from premier members AWS, SAP, and Uber and general members Aiven, Aryn, Atlassian, Canonical, DigitalOcean, Eliatra, Graylog, NetApp Instaclustr, and Portal26."* (IBM subsequently joined as a Premier Member.)
@@ -98,7 +98,7 @@ Both are JSON-native today; the surface syntax differs but the underlying primit
 |---|---|---|---|
 | BM25 default | yes | yes | yes |
 | Faceting / aggregations | yes (JSON Facet API) | yes | yes |
-| Vector search (HNSW) | yes | yes (FAISS/NMSLIB/Lucene) | yes |
+| Vector search (HNSW) | yes | yes (Faiss/Lucene — NMSLIB was removed in OpenSearch 3.0) | yes |
 | Scalar/binary vector quantization | yes (Solr 10) | yes | yes |
 | GPU vector search | experimental (cuVS pluggable codec, Solr 10 — new, not battle-tested) | experimental (k-NN plugin) | experimental |
 | Native RRF | Solr 10.1 / 9.11 (not 10.0) | yes | yes |
@@ -110,7 +110,7 @@ Both are JSON-native today; the surface syntax differs but the underlying primit
 | ILM / time-series tiers | partial (aliases) | yes (ISM) | yes (ILM) |
 | Security (TLS, RBAC, audit) | yes free | yes free | partial in basic, full in paid |
 | Built-in ML / anomaly detection | partial | yes free | yes paid |
-| Observability stack | Prometheus, OTEL (Solr 10) | OpenSearch Dashboards, OTEL | Kibana, APM (paid) |
+| Observability stack | Prometheus, OTEL (Solr 10) | OpenSearch Dashboards, OTEL | Kibana, APM (core free; advanced features paid) |
 | Kubernetes operator | Apache Solr Operator (ASF) | OpenSearch Operator | Elastic Cloud on Kubernetes (ECK) |
 
 : Feature-by-feature comparison of Solr 10, OpenSearch 3.x, and Elasticsearch 9.x across scoring, vectors, RRF, LTR, security, observability, and Kubernetes tooling. {#tbl-07-feature-comparison}
@@ -120,7 +120,7 @@ Both are JSON-native today; the surface syntax differs but the underlying primit
 Independent and vendor benchmarks both exist and contradict each other depending on the workload. Honest summary:
 
 - For **lexical search at scale**, the three are within a small constant factor of each other; Lucene is the engine under all of them.
-- For **vector search**, OpenSearch with FAISS or NMSLIB engines sometimes outperforms the pure Lucene HNSW used by Solr, especially at very high dimensions. Solr 10's cuVS-Lucene codec is new (SOLR-17892) and reports promising numbers on synthetic benchmarks, but it has not yet seen broad production deployment as of May 2026 — treat it as experimental and benchmark on your own corpus before committing.
+- For **vector search**, OpenSearch with the Faiss engine (its default; NMSLIB was deprecated in 2.16 and removed in 3.0) sometimes outperforms the pure Lucene HNSW used by Solr, especially at very high dimensions. Solr 10's cuVS-Lucene codec is new (SOLR-17892) and reports promising numbers on synthetic benchmarks, but it has not yet seen broad production deployment as of May 2026 — treat it as experimental and benchmark on your own corpus before committing.
 - For **faceting and analytics over high-cardinality fields**, Solr's docValues + JSON Facet API has historically been very competitive.
 - For **time-series / log ingestion**, OpenSearch and Elasticsearch are more polished (ISM/ILM, rollovers, frozen tiers).
 
@@ -162,13 +162,13 @@ Chapter 6 covered the Apache Solr MCP Server — a Spring Boot facade that expos
 |---|---|---|---|
 | **Project** | Community / Apache | Elastic (official) | OpenSearch (official, Linux Foundation) |
 | **Repository** | `apache/solr-mcp` | `elastic/mcp-server-elasticsearch` | `opensearch-project/opensearch-mcp-server-py` |
-| **Implementation** | Java / Spring AI MCP | TypeScript / Node | Python |
-| **License** | Apache 2.0 | Elastic License v2 | Apache 2.0 |
+| **Implementation** | Java / Spring AI MCP | Rust (originally TypeScript) | Python |
+| **License** | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 | **Transport** | STDIO + HTTP (Streamable) | STDIO + HTTP | STDIO + HTTP / SSE |
-| **Authentication** | OAuth2 (Auth0, Keycloak, any OIDC) | API keys, Elastic Cloud auth | OpenSearch security plugin (basic, JWT, SAML) |
-| **Tool surface (core)** | `search`, `index-json/csv/xml`, `list-collections`, `get-collection-stats`, `check-health`, `create-collection`, `get-schema` | `search`, `list_indices`, `get_index`, `get_mappings`, `esql` (the Elasticsearch Query Language) | `SearchIndexTool`, `IndexMappingTool`, `ListIndexTool`, `ClusterHealthTool`, plus model-tool for ML inference |
-| **Distinctive feature** | OAuth2 across multiple IdPs; OTel/LGTM observability built in; clean Java integration | First-class **ES|QL** support — the LLM can write piped queries directly; deep tie-in with Elastic's AI Search features (semantic_text, ELSER) | First-class **neural search** tools that route through OpenSearch's built-in ML Commons; Bedrock and SageMaker integration out of the box |
-| **Maturity (May 2026)** | 1.0; production-ready for HTTP/OAuth2; ~30 deployments referenced in the wild | 1.x; widely deployed via Claude Desktop; one of the most-downloaded MCP servers | 2.x; integrated with the OpenSearch Dashboards "Assistant" |
+| **Authentication** | OAuth2 (Auth0, Keycloak, any OIDC) | API keys, Elastic Cloud auth | OpenSearch security plugin (basic, JWT) + AWS SigV4 |
+| **Tool surface (core)** | `search`, `index-json/csv/xml`, `list-collections`, `get-collection-stats`, `check-health`, `create-collection`, `get-schema` | `search`, `list_indices`, `get_mappings`, `get_shards`, `esql` (the Elasticsearch Query Language) | `SearchIndexTool`, `IndexMappingTool`, `ListIndexTool`, `ClusterHealthTool`, plus analysis extras (`DataDistributionTool`, `LogPatternAnalysisTool`) |
+| **Distinctive feature** | OAuth2 across multiple IdPs; OTel/LGTM observability built in; clean Java integration | First-class **ES|QL** support — the LLM can write piped queries directly | AWS-native auth (SigV4) and log-analysis tools; integrates with OpenSearch's ML/neural-search stack |
+| **Maturity (May 2026)** | 1.0.0-SNAPSHOT; no GA release yet | **Deprecated** — critical security fixes only; superseded by the Agent Builder MCP server built into Elastic 9.2+/Serverless | 0.9.x; integrated with the OpenSearch Dashboards "Assistant" |
 
 : Side-by-side comparison of the Apache Solr, Elastic, and OpenSearch MCP servers across implementation language, license, transport, authentication, tool surface, distinctive features, and maturity. {#tbl-07-mcp-servers}
 
@@ -176,14 +176,14 @@ All three follow the same pattern from §6.2: a thin facade that exposes the eng
 
 ### The licensing wrinkle, again
 
-The Elastic MCP Server inherits Elastic's licensing posture (§7.2). It's distributed under Elastic License v2, which prohibits offering it as a managed multi-tenant service. For an internal AI assistant inside your organisation this is fine; for a SaaS product that exposes "search-as-a-service" to customers it is not. The Apache and OpenSearch MCP servers are both pure Apache 2.0 and have no such restriction.
+The wrinkle is subtler than you'd guess. The standalone `elastic/mcp-server-elasticsearch` is itself Apache 2.0 — but Elastic has deprecated it in favour of the **Agent Builder** MCP endpoint built into the commercial Elastic distribution (9.2+/Serverless). So the *recommended* MCP-access path for Elasticsearch is now tied to the Elastic stack's own licensing and subscription tiers rather than to a freestanding Apache 2.0 server binary. For an internal AI assistant this may be fine; for a SaaS product that exposes "search-as-a-service" to customers, work through §7.2 with your legal team. The Apache Solr and OpenSearch MCP servers are freestanding Apache 2.0 projects with no such coupling.
 
 ### When the engine choice flips the MCP choice
 
 A few practical patterns:
 
 - **You already run Solr → Solr MCP is the obvious fit.** Same JVM stack, same SolrJ client library, same deployment topology, and the Java team that already operates Solr can operate the MCP server.
-- **You already run Elasticsearch → Elastic MCP gets you ES|QL.** ES|QL (Elastic's piped query language, ~Spring 2024) is genuinely well-suited to LLM consumption — pipelines compose linearly, the LLM doesn't have to nest aggregations the way it must with Query DSL. The Elastic MCP Server is the only one that exposes this surface natively.
+- **You already run Elasticsearch → the Elastic MCP path gets you ES|QL.** ES|QL (Elastic's piped query language; technical preview in 8.11, GA in 8.14, mid-2024) is genuinely well-suited to LLM consumption — pipelines compose linearly, the LLM doesn't have to nest aggregations the way it must with Query DSL. The Elastic MCP Server is the only one that exposes this surface natively.
 - **You already run OpenSearch → OpenSearch MCP gets you neural search and ML Commons.** If you've invested in OpenSearch's built-in model serving (k-NN with FAISS, ELSER-equivalent sparse retrieval, hybrid search via the search pipeline), the OpenSearch MCP Server exposes that machinery as tools the LLM can call directly.
 - **You're greenfield and the choice is open → the same Apache 2.0 / on-prem / first-class-faceting argument from §7.7 still applies**, and Solr + Apache Solr MCP Server is the cleanest stack.
 
