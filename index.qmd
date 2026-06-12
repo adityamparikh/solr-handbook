@@ -64,7 +64,7 @@ The diagram style is intentionally consistent:
 - **Box labels** describe *what a thing is*; **arrow labels** describe *what crosses the boundary*. If a label describes an action ("commit", "fan out", "watch fires"), it lives on the arrow, not the box.
 - **Bracket conventions:** `[square brackets]` for processes/components, `(rounded)` for data stores, `((double circles))` for terminal/start states. Same as standard UML/flowchart practice.
 
-When a diagram is dense (e.g., the HNSW graph walk in §3.6), it is intentionally so — the alternative would be three smaller diagrams that don't fit on one page. Read it slowly.
+When a diagram is dense (e.g., the partial-update dispatch tree in §2.8), it is intentionally so — the alternative would be three smaller diagrams that don't fit on one page. Read it slowly.
 
 ## A note on the title
 

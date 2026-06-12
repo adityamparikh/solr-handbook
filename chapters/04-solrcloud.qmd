@@ -12,7 +12,7 @@
 
 ## 4.1 The Solr 10 cluster picture
 
-In Solr 10, *"bin/solr start now defaults to starting Solr in SolrCloud mode. Use the --user-managed switch to start in standalone (user-managed) mode instead"* (Major Changes in Solr 10). The community has been moving in this direction for years; the deprecation discussion on dev@solr.apache.org dates back to 2021.
+In Solr 10, *"bin/solr start now defaults to starting Solr in SolrCloud mode. Use the --user-managed switch to start in standalone (user-managed) mode instead"* (Major Changes in Solr 10).
 
 Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powered by Apache Lucene 10.3, with numerous small and large improvements."* The cluster runtime is on **Jetty 12** and **Jakarta EE 10**, the metrics subsystem migrated to **OpenTelemetry** (replacing Dropwizard), and several long-deprecated modules (jaegertracer-configurator, analytics, hadoop-auth) have been removed.
 

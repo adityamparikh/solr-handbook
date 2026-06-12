@@ -1,6 +1,6 @@
 # Why Solr?
 
-> **What this chapter covers and why it matters.** Before you adopt any search engine, you should be able to defend, in one paragraph, why a B-tree index over `VARCHAR` columns is *not* the right tool for the job. This chapter builds that intuition with a concrete TV-shows catalog example, walks through the inverted-index data structure as it actually lives on disk in Lucene, and shows step-by-step how each kind of query (term, phrase, prefix, wildcard, fuzzy, range, boolean) is executed against those files. It ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
+> **What this chapter covers and why it matters.** Before you adopt any search engine, you should be able to defend, in one paragraph, why a B-tree index over `VARCHAR` columns is *not* the right tool for the job. This chapter builds that intuition with a concrete TV-shows catalog example, walks through the inverted-index data structure as it actually lives in a Lucene segment, and shows step-by-step how each kind of query (term, phrase, prefix, wildcard, fuzzy, range, boolean) is executed against those structures. It ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
 >
 > **Prerequisites:** Working knowledge of SQL and B-tree indexes. No prior Solr experience needed.
 >
@@ -67,7 +67,7 @@ world      1    3→(1,[3])
 
 `df` is **document frequency** (how many documents contain the term). For each match Lucene stores `tf` (term frequency in that doc) and optionally positions, payloads, and offsets.
 
-Looking up `stranger` is an `O(log V)` operation in the term dictionary (where V is vocabulary size — typically much smaller than the document count); the posting list itself is a sorted, delta-encoded, block-compressed stream of doc IDs. The conjunction `stranger AND thing` is a **leap-frog intersection** of two sorted streams, skipping with auxiliary skip-lists. The whole operation is fast even at billions of documents. Notice also that Porter stemming maps `strange` to `strang` but `strangers` only to `stranger` (the plural `-s` is stripped; `-er` never is) — three related surface forms, two distinct roots that never collapse together. This is a real quirk of the English Porter stemmer and a recurring source of "why didn't my synonym work?" confusion (covered in §2.4).
+Looking up `stranger` in the sorted term dictionary is cheap regardless of corpus size, and `stranger AND thing` is an intersection of two sorted doc-id lists driven by the smaller one — fast even at billions of documents. (§1.3 covers the structures that make this true.) Notice also that Porter stemming maps `strange` to `strang` but `strangers` only to `stranger` (the plural `-s` is stripped; `-er` never is) — three related surface forms, two distinct roots that never collapse together. This is a real quirk of the English Porter stemmer and a recurring source of "why didn't my synonym work?" confusion (covered in §2.4).
 
 ## 1.3 What's actually in a Lucene index
 
@@ -126,15 +126,15 @@ For the rest of this book, knowing that these five structures exist — and what
 
 ## 1.4 How each query type actually executes
 
-Now we can walk through the common query types and explain *which files they read* and *why their cost differs*.
+Now we can walk through the common query types and explain *which of the five structures they read* and *why their cost differs*.
 
 ### 1.4.1 Term query: `q=platforms:Netflix`
 
 The simplest case.
 
 1. The query string is run through the field's analyzer chain *only if the field has one*. A `solr.TextField` (e.g. `text_en`) lowercases, tokenizes, and stems. A `solr.StrField` does **none** of that — the input bytes are matched against the indexed bytes exactly, case included. So `platforms:Netflix` on a `string` field finds documents indexed with `"Netflix"` but **not** documents indexed with `"netflix"` or `"NETFLIX"`. This catches almost every new Solr user once: facet/sort fields are typically `StrField`, and "why doesn't my platform filter match?" is usually a casing mismatch at index time.
-2. `.tip` lookup → `.tim` block → posting list pointer.
-3. Iterate `.doc` postings; for each, score with BM25 using `.nvd` norms; skip if not in `.liv`.
+2. Look the term up in the term dictionary, which points at its posting list.
+3. Iterate the postings; score each live document with BM25 (using the per-doc length norms); skip tombstoned docs.
 
 **Cost:** linear in the number of matching docs. Cheap.
 
@@ -152,12 +152,12 @@ The simplest case.
 
 Now we need *positions*.
 
-1. Look up both terms (`.tip` + `.tim`) and get their `.doc` *and* `.pos` pointers.
+1. Look up both terms and get their posting lists *with* position data.
 2. Run the AND intersection as before to find candidate docs.
-3. For each candidate, decode the `.pos` entries for both terms in that doc. Look for a position `p_stranger` and a position `p_things` such that `p_things == p_stranger + 1` (or within `slop` for `"stranger things"~2`).
+3. For each candidate, decode the positions of both terms in that doc. Look for a position `p_stranger` and a position `p_things` such that `p_things == p_stranger + 1` (or within `slop` for `"stranger things"~2`).
 4. Score only the docs that pass the position check.
 
-**Cost:** AND intersection cost + position-stream decode per candidate. Phrase is meaningfully more expensive than the underlying AND. **Implication:** index positions only on fields where you need phrase/proximity. The `omitPositions="true"` field-type attribute on `string` and most analytics fields drops `.pos` entirely.
+**Cost:** AND intersection cost + position-stream decode per candidate. Phrase is meaningfully more expensive than the underlying AND. **Implication:** index positions only on fields where you need phrase/proximity; `omitPositions="true"` drops the position data entirely.
 
 ### 1.4.4 Prefix query: `q=title:strang*`
 
@@ -339,11 +339,11 @@ Internalizing this table is the difference between guessing about Solr performan
 
 Each posting contributes a score; the document's score is the sum across query terms. Three intuitive levers control that contribution:
 
-- **Term frequency (TF) with saturation.** Mentioning "stranger" 50 times in a synopsis is not 50× better than mentioning it once. BM25 saturates contribution as TF grows; the `k1` parameter (default `1.2`) controls *where on the curve saturation happens*. Counter-intuitively, **smaller `k1` means TF saturates faster** — the curve flattens sooner, so extra occurrences barely help. Larger `k1` keeps rewarding additional mentions for longer. If you read "k1 controls saturation rate," remember that the relationship is inverse to most people's first guess.
+- **Term frequency (TF) with saturation.** Mentioning "stranger" 50 times in a synopsis is not 50× better than mentioning it once — repeated mentions yield diminishing returns.
 - **Inverse document frequency (IDF).** Rare terms ("mindhunter") count more than common terms ("season"). `stranger` matching in a corpus where 1% of show titles contain it is far more diagnostic than `the` matching where 99% do.
-- **Length normalization.** A 4-word title `"Stranger Things Season 4"` containing "stranger things" is more relevant than a 2,000-word synopsis that happens to contain the phrase. The `b` parameter (default `0.75`, range `[0, 1]`) controls how aggressively long documents are penalized. `b=0` disables length normalization entirely; `b=1` applies it at full strength. This is the reason for the per-field-per-doc length byte in `.nvd`.
+- **Length normalization.** A 4-word title `"Stranger Things Season 4"` containing "stranger things" is more relevant than a 2,000-word synopsis that happens to contain the phrase.
 
-We revisit BM25 with the actual scoring breakdown in Chapter 3.
+The two tuning knobs — `k1` for saturation, `b` for length normalization — are covered in §3.5, where you can actually act on them: the formula, the defaults, and the counter-intuitive directions of both levers.
 
 ## 1.6 When to use Solr vs. SQL vs. a vector DB vs. Postgres FTS
 

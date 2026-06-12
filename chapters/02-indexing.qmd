@@ -397,26 +397,7 @@ A text field type has an **analyzer chain** at index time and (optionally) a dif
 
 `Tokenizer → Filter → Filter → ...`
 
-For our `text_en` above, indexing the title `"Stranger Things Season 4"` flows:
-
-```{mermaid}
-%%| label: fig-02-analyzer-chain
-%%| fig-cap: "The text_en analyzer chain transforming 'Stranger Things Season 4' through tokenization, lower-casing, stop filtering, and Porter stemming."
-flowchart LR
-    A["Stranger Things Season 4"]
-    A --> B[StandardTokenizer]
-    B --> C["Stranger, Things, Season, 4"]
-    C --> D[EnglishPossessiveFilter]
-    D --> E["Stranger, Things, Season, 4"]
-    E --> F[LowerCaseFilter]
-    F --> G["stranger, things, season, 4"]
-    G --> H[StopFilter]
-    H --> I["stranger, things, season, 4"]
-    I --> J[SnowballPorter English]
-    J --> K["stranger, thing, season, 4"]
-```
-
-A query for `Strange Things` goes through the same kind of pipeline (plus synonyms at query time) and reduces to `[strang, thing]`. Note: Porter stems `strange → strang` but leaves `stranger → stranger`. They do *not* collapse to the same root, which is one reason exact phrase matches are stronger signals than individual-token AND.
+For our `text_en` above, indexing the title `"Stranger Things Season 4"` produces `[stranger, thing, season, 4]` — the stage-by-stage trace is in the Analysis-form walkthrough just below, where you can reproduce it against a live Solr.
 
 > **Production tip — keep index and query analyzers symmetric, except for synonym expansion.** Doing synonym expansion at index time bakes the synonym set into the index and forces a reindex when you change `synonyms.txt`. Doing it at query time only requires reloading the collection. Use `SynonymGraphFilterFactory` (not the legacy `SynonymFilterFactory`) so multi-word synonyms compose correctly with phrase queries.
 

@@ -4,7 +4,7 @@
 >
 > **Prerequisites:** Chapter 1 (inverted index, query types, cost model) and Chapter 2 (you need a schema and an index to query against).
 >
-> **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search and HNSW work, with a worked cosine-similarity example; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
+> **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search works and which HNSW knobs matter; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
 >
 > **What you should not skip:** §3.5 (BM25 in honest detail) and §3.6 (vector search and hybrid retrieval — the future of every search bar).
 >
@@ -311,80 +311,15 @@ q={!knn f=embedding topK=20}[0.012, -0.183, ..., 0.044]
 
 That syntax says: "find the top-20 nearest neighbors of the given query vector in the `embedding` field." Solr uses the Lucene HNSW (Hierarchical Navigable Small World) graph internally.
 
-### HNSW: how the graph walk actually works
+### HNSW, as much as you need
 
-HNSW is a **layered proximity graph**. Every vector you index becomes a node. Edges connect each node to its approximate nearest neighbors (up to `M = hnswM`, default 16; this schema attribute was named `hnswMaxConnections` in Solr 9.x and was renamed — along with `hnswBeamWidth` → `hnswEfConstruction` — in Solr 10). The trick: not every node lives on every layer. A small fraction of nodes are randomly promoted to higher layers, where they form a sparser graph with longer edges. The top layer has only a handful of nodes; the bottom layer (layer 0) has every node.
+HNSW (Hierarchical Navigable Small World) is a **layered proximity graph**: every indexed vector becomes a node, connected to its approximate nearest neighbours, with a sparse "express-lane" top layer for coarse navigation and a dense bottom layer holding every vector. A query enters at the top, greedily descends toward its neighbourhood, then sweeps a candidate pool of size `efSearchScaleFactor × topK` at the bottom (the scale factor defaults to 1.0 and is new in Solr 10, SOLR-17928). The result is **approximate, not exact** — a little recall traded for orders of magnitude in speed over brute-force distance computation.
 
-```{mermaid}
-%%| label: fig-03-hnsw-graph-walk
-%%| fig-cap: "The HNSW layered greedy walk: enter at a sparse top layer, jump to the locally closest neighbor, descend layer by layer, and exhaust the dense bottom layer."
-flowchart TB
-    Q(("query<br/>vector"))
-    subgraph L3["Layer 3 — sparsest, long jumps"]
-        L3A(("entry<br/>point"))
-    end
-    subgraph L2["Layer 2"]
-        L2A(("○"))
-        L2B(("○"))
-    end
-    subgraph L1["Layer 1"]
-        L1A(("○"))
-        L1B(("○"))
-        L1C(("○"))
-    end
-    subgraph L0["Layer 0 — every vector, dense"]
-        L0A(("○"))
-        L0B(("○"))
-        L0C(("★ closest"))
-        L0D(("○"))
-        L0E(("○"))
-    end
-    Q -.->|"1- Enter at top"| L3A
-    L3A -->|"2- Greedy: jump to<br/>closest neighbor,<br/>descend"| L2A
-    L2A --> L2B
-    L2B -->|"3- Descend"| L1B
-    L1B --> L1C
-    L1C -->|"4- Descend to layer 0"| L0C
-    L0C -->|"5- Exhaust local<br/>neighborhood"| L0B
-    L0C --> L0D
-```
+What a practitioner actually controls: graph density at build time (`hnswM`, default 16; `hnswEfConstruction` — these were `hnswMaxConnections`/`hnswBeamWidth` in Solr 9.x) and search effort at query time (`topK`, `efSearchScaleFactor`). Defaults work well for most workloads; the [Solr Dense Vector Search reference](https://solr.apache.org/guide/solr/latest/query-guide/dense-vector-search.html) documents every knob, and the original Malkov & Yashunin paper ("[Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320)") is the canonical reference if you want the algorithm itself.
 
-The walk has two phases — a greedy descent through the upper layers, then a wider sweep at layer 0:
+### Choosing the similarity function
 
-1. **Enter** at a fixed entry point in the top layer.
-2. **Greedy step:** look at all neighbors of the current node. If any neighbor is closer to the query than the current node, move to the closest one. Repeat until no neighbor improves distance. This finds the local minimum on this layer.
-3. **Descend** to the next layer, using the local minimum as the entry point.
-4. **Repeat** until you reach layer 0.
-5. **At layer 0**, do an exhaustive search of a candidate pool of size efSearch = `efSearchScaleFactor × topK` (the scale factor defaults to 1.0 and is new in Solr 10, SOLR-17928). Return the `topK` closest from that pool.
-
-Why this is fast: each layer halves the search space. The top layers do long jumps over the vector space, like the express lanes of a skip list; the bottom layer does fine-grained local refinement. Visiting ~20 nodes out of 15,000 vectors is typical, vs. 15,000 brute-force distance computations.
-
-Approximate, not exact — the algorithm trades a small amount of recall for orders of magnitude in speed.
-
-The main knobs you have on HNSW are graph density at build time, build-time search effort, and query-time search effort. Defaults work well for most workloads; the [Solr Dense Vector Search reference](https://solr.apache.org/guide/solr/latest/query-guide/dense-vector-search.html) covers all of them. For the algorithm itself, the original paper by Malkov & Yashunin ("[Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320)") is the canonical reference.
-
-### Cosine similarity, with an example
-
-The HNSW graph walk finds candidates close to the query, but "close" needs a distance metric. The most common for embedding vectors is **cosine similarity**: it measures the *angle* between two vectors, ignoring their magnitudes.
-
-Two vectors pointing in the same direction → cosine `1.0`. Perpendicular → `0.0`. Opposite → `-1.0`. In practice with real text embeddings you almost always see values in roughly `[0.0, 1.0]` — strongly negative similarities are rare because nothing in natural-language space points the *opposite* direction of anything else.
-
-A worked example with four documents. **The numbers below are illustrative, not measured** — they are the *shape* you should expect from a modern sentence-embedding model (e.g., `sentence-transformers/all-MiniLM-L6-v2`, OpenAI `text-embedding-3-small`). Exact values depend on the model, the corpus, and the prompt template; if you reproduce this exercise locally you will see different absolute numbers but the same *ordering*.
-
-Query: `"dark sci-fi thriller about memory and identity"`. Suppose we embed this query and the description of four shows from our seed catalog:
-
-| Document | Description (excerpt) | Cosine to query (illustrative) |
-|---|---|---|
-| `SVR-001` (Severance) | "Workers undergo a procedure that surgically divides their memories between their work and personal lives." | **~0.85–0.95** — semantic bullseye |
-| `BM-001` (Black Mirror) | "Anthology series exploring a twisted, high-tech multiverse where humanity's greatest innovations and darkest instincts collide." | **~0.70–0.80** — same concept space, different words |
-| `BRG-001` (Bridgerton) | "Wealth, lust, and betrayal set in the backdrop of Regency-era England." | **~0.05–0.15** — unrelated topic |
-| `MH-001` (Mindhunter) | "FBI agents interview imprisoned serial killers to understand their psychology." | **~0.30–0.45** — shares "dark" and "psychological" but not sci-fi |
-
-Three things worth noticing:
-
-1. **Direct keyword overlap helps** (`SVR-001` shares "memories"), but it's not required. `BM-001` has near-zero word overlap with the query yet scores well — that's the semantic similarity working as advertised.
-2. **Polysemy is partially handled** (`MH-001`). It is "dark" and "psychological" but not "sci-fi," and the embedding model knows that. The score drops below `BM-001` but stays above totally unrelated shows like `BRG-001`.
-3. **Magnitude doesn't matter.** A 6-word title and a 500-word synopsis that both genuinely talk about the same concept can score similarly — cosine ignores vector length. (Compare with BM25, which heavily penalizes long documents.)
+"Close" needs a metric. **Cosine similarity** — the angle between two vectors, ignoring magnitude — is the common one for text embeddings: parallel → `1.0`, perpendicular → `0.0`, opposite → `-1.0` (real text embeddings almost always land in roughly `[0.0, 1.0]`). Two properties matter in practice: semantically similar texts score high *without* sharing words — that's the entire point versus BM25 — and document length doesn't matter, because cosine ignores vector magnitude (contrast BM25's length normalization). For the underlying math, see the [Wikipedia article on cosine similarity](https://en.wikipedia.org/wiki/Cosine_similarity) or Pinecone's [introduction to vector similarity](https://www.pinecone.io/learn/vector-similarity/); for a hands-on feel, the companion code's `VectorSearchIntegrationTest` queries real (4-dimensional, readable) embeddings and asserts the cosine ordering.
 
 #### `similarityFunction` in `DenseVectorField`
 
@@ -405,7 +340,6 @@ Which one to choose:
 
 > **Production tip.** Confirm your embedding model's output is normalized once (compute the L2 norm of a sample vector — it should be very close to `1.0`), then use `dot_product`. Free performance.
 
-For the underlying math, see the [Wikipedia article on cosine similarity](https://en.wikipedia.org/wiki/Cosine_similarity) or Pinecone's [introduction to cosine similarity](https://www.pinecone.io/learn/vector-similarity/).
 
 ### What's new in Solr 10 for vectors
 
@@ -542,7 +476,7 @@ flowchart LR
     RRF --> OUT["fused top-K"]
 ```
 
-Suppose, for the query `"dark sci-fi thriller about memory and identity"` (continuing the example from §3.6's cosine table), the two retrievers return:
+Suppose, for the query `"dark sci-fi thriller about memory and identity"`, the two retrievers return:
 
 - **BM25 ranks:** `MH-001` (#1, score 12.5), `BB-001` (#2, 11.2), `BM-001` (#3, 10.8), `WW-001` (#4, 9.5), `BRG-001` (#5, 8.3)
 - **KNN ranks:** `SVR-001` (#1, cos 0.92), `MH-001` (#2, 0.89), `BM-001` (#3, 0.85), `BB-001` (#4, 0.81), `WW-001` (#5, 0.78)
