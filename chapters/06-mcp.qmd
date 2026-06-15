@@ -19,32 +19,7 @@ The **[Model Context Protocol](https://modelcontextprotocol.io)** (MCP) is an op
 
 Think of it as a USB-C port for AI: one protocol, many capabilities, no per-vendor adapter. The specification, reference clients, and the protocol [Inspector](https://github.com/modelcontextprotocol/inspector) all live at [modelcontextprotocol.io](https://modelcontextprotocol.io).
 
-```{mermaid}
-%%| label: fig-06-why-mcp
-%%| fig-cap: "The M×N integration problem and MCP's M+N answer: without a shared protocol every client needs a bespoke connector to every system; with MCP each client and each system implements one protocol once."
-flowchart LR
-    subgraph Without["Without MCP — M×N connectors"]
-        direction LR
-        a1[Claude Desktop] --> d1[(Solr)]
-        a1 --> d2[(Postgres)]
-        a1 --> d3[Web API]
-        a2[Cursor] --> d1
-        a2 --> d2
-        a2 --> d3
-        a3[Custom agent] --> d1
-        a3 --> d2
-        a3 --> d3
-    end
-    subgraph With["With MCP — M+N connectors"]
-        direction LR
-        b1[Claude Desktop] --> M[MCP]
-        b2[Cursor] --> M
-        b3[Custom agent] --> M
-        M --> e1[(Solr)]
-        M --> e2[(Postgres)]
-        M --> e3[Web API]
-    end
-```
+![The M×N integration problem and MCP's M+N answer: without a shared protocol every client needs a bespoke connector to every system; with MCP each client and each system implements one protocol once.](figures/06-mcp/mcp-why-mcp.png){#fig-06-why-mcp}
 
 For Solr specifically, the protocol is a near-perfect fit:
 
@@ -85,19 +60,7 @@ The one-line distinction: **a skill teaches the model the playbook; MCP gives it
 
 : How agent skills and MCP differ across what they are, how they load, where they run, how they are invoked, and their trust boundary. {#tbl-06-skills-vs-mcp}
 
-```{mermaid}
-%%| label: fig-06-skills-vs-mcp
-%%| fig-cap: "Skills and MCP are different layers of the agent stack: a skill is the playbook loaded into the model (what to do), while MCP is the hands that execute it against a live system (how to act). Here a Solr skill drives the solr-mcp search tool."
-flowchart LR
-    U[User] -->|natural language| A
-    subgraph Host["Agent host (Claude Code / Desktop)"]
-        A[LLM]
-        SK[Solr skill<br/>SKILL.md + scripts]
-        SK -.->|playbook, loaded on match| A
-    end
-    A -->|JSON-RPC tool call| MCP[solr-mcp server]
-    MCP -->|SolrJ| SOLR[(Apache Solr)]
-```
+![Skills and MCP are different layers of the agent stack: a skill is the playbook loaded into the model (what to do), while MCP is the hands that execute it against a live system (how to act). The bottom row shows the two working together — a Solr skill driving a solr-mcp tool call against a live cluster.](figures/06-mcp/mcp-skills-vs-mcp.png){#fig-06-skills-vs-mcp}
 
 ## 6.2 The Apache Solr MCP Server: architecture
 
@@ -115,41 +78,7 @@ org.apache.solr.mcp.server
 
 The component graph:
 
-```{mermaid}
-%%| label: fig-06-mcp-architecture
-%%| fig-cap: "Three-layer Solr MCP architecture: MCP clients talk to a Spring AI MCP server over STDIO or HTTP, which proxies through SolrJ to an existing Solr cluster."
-flowchart LR
-    subgraph Clients["MCP Clients"]
-      CD[Claude Desktop]
-      CC[Claude Code]
-      VS[VS Code / Copilot]
-      CR[Cursor]
-      JB[JetBrains AI]
-      IN[MCP Inspector]
-    end
-    subgraph Server["Solr MCP Server (Spring AI MCP)"]
-      direction TB
-      T1[search]
-      T2[index-json / csv / xml]
-      T3[list-collections]
-      T4[get-collection-stats]
-      T5[check-health]
-      T6[create-collection]
-      T7[get-schema]
-      R1[(solr://collections<br/>solr://collection/schema)]
-    end
-    subgraph Solr["Apache Solr (Ch 4)"]
-      direction TB
-      C1[(shows collection)]
-      C2[(shows_signals)]
-      C3[(other collections)]
-    end
-    OTEL[(LGTM stack<br/>traces · metrics · logs)]
-
-    Clients -->|STDIO or HTTP+MCP| Server
-    Server -->|SolrJ HTTP| Solr
-    Server -.->|OTLP, HTTP mode only| OTEL
-```
+![Solr MCP architecture: an MCP client (Claude Desktop, Claude Code, Cursor, MCP Inspector) talks the protocol to the Spring AI MCP server, which uses SolrJ — the official Java client — to reach an existing Apache Solr cluster.](figures/06-mcp/mcp-architecture.png){#fig-06-mcp-architecture}
 
 Three layers, three responsibilities:
 
@@ -176,27 +105,7 @@ Tools are the only primitive the LLM *invokes*. Resources and prompts can be inv
 
 The same four primitives, organised by *who drives each one* — the model, the application, or the user — and which ones actually reach Solr:
 
-```{mermaid}
-%%| label: fig-06-primitives
-%%| fig-cap: "The four primitives by who controls them: the model invokes tools and reads resources; the user picks prompts and types into completions. Only tools and resources reach Solr — prompts and completions stay in the client."
-flowchart TB
-    MODEL[LLM / model]
-    USER[Human user]
-    subgraph Server["Solr MCP server"]
-        direction TB
-        TOOLS["Tools — model-controlled<br/>search · index-json/csv/xml<br/>create-collection · get-schema"]
-        RES["Resources — application-controlled<br/>solr://collections<br/>solr://shows/schema"]
-        PROMPTS["Prompts — user-controlled<br/>explore-collections · design-schema<br/>search-collection"]
-        COMP["Completions — user-triggered<br/>prefix-filtered collection names"]
-    end
-    SOLR[(Apache Solr)]
-    MODEL -->|invokes| TOOLS
-    MODEL -->|reads| RES
-    USER -->|picks| PROMPTS
-    USER -->|types into| COMP
-    TOOLS -->|SolrJ| SOLR
-    RES -->|SolrJ| SOLR
-```
+![The four MCP primitives and how Solr MCP uses each: tools (model-controlled actions like search, indexing, and schema changes), resources (application-controlled read-only context such as `solr://{collection}/schema`), prompts (user-controlled templates), and completions (user-triggered typeahead).](figures/06-mcp/mcp-primitives.png){#fig-06-primitives}
 
 ### 6.3.1 Tools — `@McpTool`
 
@@ -435,26 +344,7 @@ That's the entire user-visible API: 11 tools, 2 resources, 6 prompts, 5 completi
 
 The server supports both MCP transports. They are not interchangeable; pick by deployment shape:
 
-```{mermaid}
-%%| label: fig-06-transports
-%%| fig-cap: "The two transports as topologies: in STDIO the client spawns the server as a child process and they share one process over stdin/stdout (one user); in HTTP one long-lived server fronts many clients over authenticated HTTPS."
-flowchart TB
-    subgraph STDIO["STDIO — local, single-user (default)"]
-        direction LR
-        subgraph Proc["one host process"]
-            direction LR
-            SC[LLM client] -->|JSON-RPC over stdin/stdout| SS[MCP server]
-        end
-        SS -->|SolrJ| SD[(Solr)]
-    end
-    subgraph HTTP["HTTP — shared service, many clients"]
-        direction LR
-        HC1[Claude Desktop] -->|HTTPS + JWT| HS["MCP server<br/>web service on :8080"]
-        HC2[Cursor] -->|HTTPS + JWT| HS
-        HC3[CI / agent] -->|HTTPS + JWT| HS
-        HS -->|SolrJ| HD[(Solr)]
-    end
-```
+![The two MCP transports. STDIO (right) co-locates an LLM client and the server in one process over stdin/stdout — simplest and single-user. HTTP (left) runs one long-lived server that many clients reach over Streamable HTTP.](figures/06-mcp/mcp-transports.png){#fig-06-transports}
 
 | | STDIO | HTTP |
 |---|---|---|
