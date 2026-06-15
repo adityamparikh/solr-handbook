@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package solrbook.indexing;
 
 import java.util.LinkedHashMap;

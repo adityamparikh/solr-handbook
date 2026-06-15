@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package solrbook.support;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
