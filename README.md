@@ -65,7 +65,7 @@ The same `_quarto.yml` produces all three. Figure and table numbering is consist
 
 ## Authoring conventions
 
-- **Diagrams.** [Mermaid](https://mermaid.js.org/) inside ` ```{mermaid} ` Quarto blocks. Every block carries a `%%| label: fig-NN-slug` and a `%%| fig-cap: "…"` so it shows up in the figure list and is cross-referenceable.
+- **Diagrams.** Most diagrams are [Mermaid](https://mermaid.js.org/) inside ` ```{mermaid} ` Quarto blocks; each carries a `%%| label: fig-NN-slug` and a `%%| fig-cap: "…"` so it shows up in the figure list and is cross-referenceable. A handful of Chapter 6 figures are raster images cropped from the companion conference talk (stored in `chapters/figures/06-mcp/` and referenced as `![caption](…){#fig-…}`) rather than Mermaid.
 - **Tables.** Pandoc tables; major ones carry a trailing caption `: Caption text {#tbl-NN-slug}` for cross-referencing.
 - **Cross-references in prose.** `@fig-06-mcp-architecture` becomes "Figure 6.1"; `@tbl-06-primitives` becomes "Table 6.1". Section references stay textual (`see §6.3`).
 - **Callouts.** Block-quotes prefixed with `**Production tip — …**` or `**Solr 9 difference — …**` for hard-won operational advice and version-drift warnings.
