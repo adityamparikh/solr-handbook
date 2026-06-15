@@ -1,0 +1,61 @@
+name: Publish book
+
+# Render the HTML book with Quarto and deploy it to GitHub Pages on every push
+# to main that touches book content. The companion Java project under code/ has
+# its own CI (companion-code) and does not need a site rebuild, so it is ignored
+# here. Only HTML is built in CI — it needs no LaTeX and is fast; the print PDF
+# and EPUB are served from the committed dist/ snapshot.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "code/**"
+  workflow_dispatch:
+
+# Required by actions/deploy-pages (OIDC token + Pages write).
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; let an in-progress deploy finish rather than cancel.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+        with:
+          version: "1.9.37"
+
+      - name: Render HTML book
+        run: quarto render --to html
+
+      - name: Bundle the print PDF and EPUB as downloads
+        run: cp dist/*.pdf dist/*.epub _book/
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

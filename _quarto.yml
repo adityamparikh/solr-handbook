@@ -18,7 +18,8 @@ book:
     (MCP) integration, and an honest comparison with Elasticsearch and
     OpenSearch.
   search: true
-  repo-url: https://github.com/adityamparikh/solr-handbook  # adjust when published
+  site-url: https://adityamparikh.github.io/solr-handbook/
+  repo-url: https://github.com/adityamparikh/solr-handbook
   repo-branch: main
   sidebar:
     style: docked
