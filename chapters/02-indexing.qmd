@@ -594,7 +594,7 @@ SolrJ also supports **atomic updates** — modify a single field without resendi
 
 ### The official Docker image
 
-The official image is the Docker Official Image [`solr`](https://hub.docker.com/_/solr) on Docker Hub (there is no `apache/solr` repository). Tags follow Solr releases: `solr:10.0.0`, `solr:9.9`, `solr:latest`, plus `-slim` variants. The Solr Admin UI is available on port 8983 — useful for poking at a running container while debugging a test.
+The official image is the Docker Official Image [`solr`](https://hub.docker.com/_/solr) on Docker Hub (there is no `apache/solr` image on Docker Hub; the Dockerfiles themselves live in the Apache-maintained [`apache/solr-docker`](https://github.com/apache/solr-docker) repo). Tags follow Solr releases: `solr:10.0.0`, `solr:9.9`, `solr:latest`, plus `-slim` variants. The Solr Admin UI is available on port 8983 — useful for poking at a running container while debugging a test.
 
 > **Admin UI for debugging.** When a test is failing and you want to inspect the index, add a `Thread.sleep(300_000)` breakpoint, connect to `http://localhost:<mappedPort>/solr`, and use the **Analysis** tab (to trace how a string is tokenized), the **Query** tab (to run ad-hoc queries), and the **Schema** tab (to inspect field definitions). It's the fastest way to diagnose analyzer chain or schema issues without writing more test code. See the [Solr Admin UI reference](https://solr.apache.org/guide/solr/latest/getting-started/solr-admin-ui.html) for the full tour.
 
@@ -737,7 +737,7 @@ These are the only six. Anything else — rename a field, concatenate strings, d
 
 #### Schema requirements
 
-From the Solr 10 reference guide: every "real" field your application populates must be `stored="true"` OR `docValues="true"`. Solr reconstructs the document from one of those. The exception is `copyField` destinations, which must **not** be stored and must not behave as if stored (`useDocValuesAsStored="false"`), otherwise on each atomic update Solr would double-write — once from the source-field copy and once from the existing stored destination value — producing duplicate or stale tokens.
+From the Solr 10 reference guide: every "real" field your application populates must be `stored="true"` OR `docValues="true"`. Solr reconstructs the document from one of those. The exception is `copyField` destinations, which must **not** be stored and must not behave as if stored — `stored="false"`, plus `useDocValuesAsStored="false"` if the destination keeps `docValues` — otherwise on each atomic update Solr would double-write — once from the source-field copy and once from the existing stored destination value — producing duplicate or stale tokens.
 
 If any required field violates these rules, the entire atomic update fails. There is no partial recovery.
 

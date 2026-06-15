@@ -377,7 +377,7 @@ Combine the resulting feature vectors with the implicit judgments from your sign
 
 ## 5.5 The `relatedness()` aggregation — Solr's built-in Semantic Knowledge Graph
 
-Per the Solr 7.4 release notes: *"SOLR-9480: A new 'relatedness()' aggregate function for JSON Faceting to enable building Semantic Knowledge Graphs."* The contribution from Trey Grainger and Chris M. Hostetter added a JSON Facet aggregation that scores how strongly any term — or facet bucket — is associated with a *foreground* document set versus a *background* set. Effectively, every inverted-index term becomes a node, and edges materialize on demand from corpus statistics. A knowledge graph for free, with no extra index.
+Per the Solr 7.4 release notes: *"SOLR-9480: A new 'relatedness()' aggregate function for JSON Faceting to enable building Semantic Knowledge Graphs."* The contribution from Trey Grainger and Chris M. Hostetter added a JSON Facet aggregation that scores how strongly any term — or facet bucket — is associated with a *foreground* document set versus a *background* set. Effectively, every indexed term is a node, and the edge weight between any two is computed on the fly from how their postings lists overlap — there is no separate graph to build or store. A knowledge graph for free, riding on the inverted index you already have.
 
 This is the only crowdsourced-relevance technique that lives *inside* Solr itself, with zero external infrastructure. Use it for query expansion ("what genres co-occur with `stranger things` but not with everything?"), "more like this" widgets, "if you liked X, you might like Y" recommendations, and faceted *content* discovery beyond simple counts.
 
@@ -507,10 +507,10 @@ q=stranger things&elevateIds=ST-001&excludeIds=MH-001
 And surface the override in your UI using document transformers:
 
 ```text
-fl=id,title,rating,[elevated],[excluded]
+fl=id,title,rating,[elevated],[excluded]&markExcludes=true
 ```
 
-`[elevated]` returns `true` for documents pinned by the elevator — perfect for a "Featured" or "Sponsored" badge.
+`[elevated]` returns `true` for documents pinned by the elevator — perfect for a "Featured" or "Sponsored" badge. `[excluded]` flags documents the rules pushed *down*, but only when the request also sets `markExcludes=true` — otherwise excluded documents are simply dropped, never returned to be marked.
 
 > **Production tip — store editorial rules outside the configset.** `elevate.xml` in the configset means every editorial change forces a configset reload. For a fast-moving editorial team, host the rules in a small admin app that writes `elevateIds`/`excludeIds` directly on each request from a database — same outcome, no Solr restart.
 
