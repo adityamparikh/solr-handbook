@@ -355,7 +355,7 @@ The walk has two phases — a greedy descent through the upper layers, then a wi
 2. **Greedy step:** look at all neighbors of the current node. If any neighbor is closer to the query than the current node, move to the closest one. Repeat until no neighbor improves distance. This finds the local minimum on this layer.
 3. **Descend** to the next layer, using the local minimum as the entry point.
 4. **Repeat** until you reach layer 0.
-5. **At layer 0**, do an exhaustive search of a candidate pool of size efSearch = `efSearchScaleFactor × topK` (the scale factor defaults to 1.0 and is new in Solr 10, SOLR-17928). Return the `topK` closest from that pool.
+5. **At layer 0**, run a best-first traversal that keeps a candidate list (a *beam*) of width efSearch = `efSearchScaleFactor × topK` (the scale factor defaults to 1.0 and is new in Solr 10, SOLR-17928) — not an exhaustive scan of the layer. Return the `topK` closest found.
 
 Why this is fast: each layer halves the search space. The top layers do long jumps over the vector space, like the express lanes of a skip list; the bottom layer does fine-grained local refinement. Visiting ~20 nodes out of 15,000 vectors is typical, vs. 15,000 brute-force distance computations.
 
@@ -396,6 +396,8 @@ Solr exposes three similarity functions on the field type:
            similarityFunction="cosine"      <!-- options: dot_product, euclidean, cosine -->
            knnAlgorithm="hnsw"/>
 ```
+
+The field-type default is **`euclidean`**, so always set `similarityFunction` explicitly — the right choice depends on how your embedding model was trained, and `euclidean` is rarely it.
 
 Which one to choose:
 
@@ -568,7 +570,7 @@ Sorted final ranking:
 
 **The key insight:** documents that appear in *both* lists at reasonable ranks systematically beat documents that appear in *only one* list at the top rank. Cross-retriever agreement is the strongest signal you have for relevance. This is why RRF works so well in practice despite being almost trivially simple.
 
-**Important version note.** Native Reciprocal Rank Fusion is tracked in Apache JIRA as **SOLR-17319**. The JIRA records: *"Fix Version/s: 10.1, 9.11"*. RRF is **not** in Solr 10.0.0 — you must wait for **Solr 10.1** (or Solr 9.11 on the 9.x line) for the native query-parser form. In the meantime, do RRF in your application layer (run a BM25 query and a KNN query in parallel, merge results client-side) or use the rerank pattern above.
+**Important version note.** Native Reciprocal Rank Fusion is tracked in Apache JIRA as **SOLR-17319**. The JIRA records: *"Fix Version/s: 10.1, 9.11"*. RRF is **not** in Solr 10.0.0 — you must wait for **Solr 10.1** (or Solr 9.11 on the 9.x line) for native support. When it lands it is a request-level **`combiner`** (enabled with `combiner=true` and tuned with `combiner.upTo`), *not* a query parser — so there is no `{!rrf}` to reach for. In the meantime, do RRF in your application layer (run a BM25 query and a KNN query in parallel, merge results client-side) or use the rerank pattern above.
 
 ```java
 // Client-side RRF in SolrJ (works on Solr 10.0)

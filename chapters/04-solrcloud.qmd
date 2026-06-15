@@ -97,7 +97,7 @@ flowchart LR
 The Solr reference guide defines them succinctly:
 
 - **NRT (Near Real Time)** — *"maintains a transaction log and updates its index locally. Replicas of type NRT support NRT (soft commits) and RTG. Any NRT replica can become a leader."* Indexes everything locally at write time; soft commits make new docs visible within seconds.
-- **TLOG** — *"maintains a transaction log but only updates its index via replication."* The leader forwards docs to TLOG replicas, which **append them to their own transaction log** and **pull segment files from the leader**. They do *not* run the analyzer chain or build segments locally for incoming writes; that CPU cost is paid only by the leader. The tlog exists so a TLOG replica can become the leader by replaying its log up to the latest version (peer sync) if the current leader fails.
+- **TLOG** — *"maintains a transaction log but only updates its index via replication."* The leader forwards docs to TLOG replicas, which **append them to their own transaction log** and **pull segment files from the leader**. They do *not* run the analyzer chain or build segments locally for incoming writes; that CPU cost is paid only by the leader. The tlog exists so a TLOG replica can become the leader if the current leader fails — replaying its transaction log to catch up and reconciling with its peers (the recovery path, including how peer sync differs from full replication, is detailed in §4.6).
 - **PULL** — *"does not maintain a transaction log and only updates its index via replication. This type is not eligible to become a leader."* Pure search replica. Cheapest replica type. Cannot become leader because it has no tlog to replay.
 
 | Replica type | Indexes from writes | Has tlog | Leader-eligible | Best for |
@@ -267,7 +267,7 @@ In Solr 9.0 the entire autoscaling framework was removed (SOLR-14656): *"Autosca
 What replaces it in Solr 9+ and continues into Solr 10:
 
 1. **Replica Placement Plugins.** A pluggable API for *where to put a replica* on collection create / replica add. Stock implementations:
-   - `AffinityPlacementFactory` — respects availability zones, replica types, disk usage. The recommended choice for production (Solr's out-of-the-box default when no plugin is configured is the simpler `SimplePlacementFactory`). The default `minimalFreeDiskGB` is 5, lowered from the original 20 in Solr 9.7 (SOLR-16915); the example below raises it back to 20.
+   - `AffinityPlacementFactory` — respects availability zones, replica types, disk usage; the placement plugin to reach for in production (Solr's out-of-the-box default when no plugin is configured is the simpler `SimplePlacementFactory`). Its default `minimalFreeDiskGB` is 5, lowered from the original 20 in Solr 9.4 (SOLR-16915); the example below raises it back to 20.
    - `MinimizeCoresPlacementFactory` — pure load balancing.
    - `RandomPlacementFactory` — testing.
 2. **Node Roles.** A node can have role `overseer`, `data`, and/or (since Solr 9.3) `coordinator` — letting you dedicate nodes to cluster coordination, indexing/serving, or distributed-query aggregation.
