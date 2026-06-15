@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package solrbook.support;
 
 import com.fasterxml.jackson.databind.JsonNode;

@@ -1,0 +1,12 @@
+Apache Solr: A Practical Engineering Handbook — companion code
+Copyright 2026 Aditya Parikh
+
+This product is the companion source code for the book
+"Apache Solr: A Practical Engineering Handbook" by Aditya Parikh,
+licensed under the Apache License, Version 2.0 (see the LICENSE file
+in this directory).
+
+This software is not a product of, affiliated with, or endorsed by the
+Apache Software Foundation. "Apache", "Apache Solr", "Apache Lucene", and
+"Apache ZooKeeper" are trademarks of the Apache Software Foundation; their
+use here is descriptive only.
