@@ -19,6 +19,33 @@ The **[Model Context Protocol](https://modelcontextprotocol.io)** (MCP) is an op
 
 Think of it as a USB-C port for AI: one protocol, many capabilities, no per-vendor adapter. The specification, reference clients, and the protocol [Inspector](https://github.com/modelcontextprotocol/inspector) all live at [modelcontextprotocol.io](https://modelcontextprotocol.io).
 
+```{mermaid}
+%%| label: fig-06-why-mcp
+%%| fig-cap: "The M×N integration problem and MCP's M+N answer: without a shared protocol every client needs a bespoke connector to every system; with MCP each client and each system implements one protocol once."
+flowchart LR
+    subgraph Without["Without MCP — M×N connectors"]
+        direction LR
+        a1[Claude Desktop] --> d1[(Solr)]
+        a1 --> d2[(Postgres)]
+        a1 --> d3[Web API]
+        a2[Cursor] --> d1
+        a2 --> d2
+        a2 --> d3
+        a3[Custom agent] --> d1
+        a3 --> d2
+        a3 --> d3
+    end
+    subgraph With["With MCP — M+N connectors"]
+        direction LR
+        b1[Claude Desktop] --> M[MCP]
+        b2[Cursor] --> M
+        b3[Custom agent] --> M
+        M --> e1[(Solr)]
+        M --> e2[(Postgres)]
+        M --> e3[Web API]
+    end
+```
+
 For Solr specifically, the protocol is a near-perfect fit:
 
 - **Tools map cleanly to Solr operations.** "Search a collection," "list collections," "get the schema," "index a batch of documents," "create a collection" — every one is a verb-noun pair the protocol already knows how to express. The LLM doesn't need to know that the search verb under the hood becomes a `/select?q=...&fq=...&facet=true` URL; it sees a `search` tool with named parameters.
@@ -41,6 +68,36 @@ a user can ask their assistant:
 > *"Find Netflix sci-fi shows with 'stranger things' in the title released since 2015, break down by genre, and sort by rating."*
 
 The LLM, using the Solr MCP Server, picks the right tool, fills in the parameters, runs the query, and presents the results — citing the actual documents. The user never sees the URL.
+
+### 6.1.1 Skills vs. MCP — different layers of the agent stack
+
+A common point of confusion in 2026 is how MCP relates to *agent skills* (such as Claude's `SKILL.md` files). They are not competitors; they occupy different layers of the agent stack. A **skill** is instructions *for the model* — a folder holding a `SKILL.md` playbook (plus optional scripts) that teaches the model *how to approach a task*. It loads by progressive disclosure: only its name and one-line description sit in the context window until a task matches, at which point the body is pulled in. It runs inside the agent's own environment, at the same trust level as the local filesystem. **MCP**, by contrast, is a protocol for *calling external systems* — a client/server contract over JSON-RPC in which the model invokes a typed, schema-validated tool that runs in a separate process or container, across a network or process boundary, with OAuth2 in HTTP mode.
+
+The one-line distinction: **a skill teaches the model the playbook; MCP gives it the hands to run the play.** They compose. A "search Solr well" skill can encode your house conventions — *always read the schema first, prefer `fq` over `q` for facets, never let `rows` exceed 100* — and then drive the `solr-mcp` `search` tool to execute them against a live cluster. The skill supplies the judgment; MCP supplies the verified retrieval.
+
+| | Skill | MCP |
+|---|---|---|
+| **What it is** | A folder of `SKILL.md` + scripts | A client/server protocol over JSON-RPC |
+| **Loading** | Progressive disclosure — name + description (~tens of tokens); body on match | Tool schemas loaded per server (often 1k–10k+ tokens up front) |
+| **Runtime** | Inside the agent's environment; no extra process | A separate process / container with its own runtime and dependencies |
+| **Invocation** | The model reads `SKILL.md` and follows the steps | The model calls a typed tool; arguments are JSON-Schema-validated |
+| **Trust boundary** | Same trust as the local filesystem | A network / process boundary; OAuth2 in HTTP mode |
+
+: How agent skills and MCP differ across what they are, how they load, where they run, how they are invoked, and their trust boundary. {#tbl-06-skills-vs-mcp}
+
+```{mermaid}
+%%| label: fig-06-skills-vs-mcp
+%%| fig-cap: "Skills and MCP are different layers of the agent stack: a skill is the playbook loaded into the model (what to do), while MCP is the hands that execute it against a live system (how to act). Here a Solr skill drives the solr-mcp search tool."
+flowchart LR
+    U[User] -->|natural language| A
+    subgraph Host["Agent host (Claude Code / Desktop)"]
+        A[LLM]
+        SK[Solr skill<br/>SKILL.md + scripts]
+        SK -.->|playbook, loaded on match| A
+    end
+    A -->|JSON-RPC tool call| MCP[solr-mcp server]
+    MCP -->|SolrJ| SOLR[(Apache Solr)]
+```
 
 ## 6.2 The Apache Solr MCP Server: architecture
 
@@ -116,6 +173,30 @@ Every MCP server is built from the three server primitives — tools, resources,
 : The four MCP primitives — tool, resource, prompt, completion — with the Spring AI annotation, what the LLM sees, and what the human user sees in the client UI. {#tbl-06-mcp-primitives}
 
 Tools are the only primitive the LLM *invokes*. Resources and prompts can be invoked *or* surfaced for the user to choose. Completions are pure UX glue — they exist to make the other three pleasant to use from a typeahead picker. Pin this table; it's the conceptual surface of every MCP server you'll meet.
+
+The same four primitives, organised by *who drives each one* — the model, the application, or the user — and which ones actually reach Solr:
+
+```{mermaid}
+%%| label: fig-06-primitives
+%%| fig-cap: "The four primitives by who controls them: the model invokes tools and reads resources; the user picks prompts and types into completions. Only tools and resources reach Solr — prompts and completions stay in the client."
+flowchart TB
+    MODEL[LLM / model]
+    USER[Human user]
+    subgraph Server["Solr MCP server"]
+        direction TB
+        TOOLS["Tools — model-controlled<br/>search · index-json/csv/xml<br/>create-collection · get-schema"]
+        RES["Resources — application-controlled<br/>solr://collections<br/>solr://shows/schema"]
+        PROMPTS["Prompts — user-controlled<br/>explore-collections · design-schema<br/>search-collection"]
+        COMP["Completions — user-triggered<br/>prefix-filtered collection names"]
+    end
+    SOLR[(Apache Solr)]
+    MODEL -->|invokes| TOOLS
+    MODEL -->|reads| RES
+    USER -->|picks| PROMPTS
+    USER -->|types into| COMP
+    TOOLS -->|SolrJ| SOLR
+    RES -->|SolrJ| SOLR
+```
 
 ### 6.3.1 Tools — `@McpTool`
 
@@ -203,6 +284,29 @@ search(
 What it does *not* expose: `defType` (parser selection), `qf`/`pf`/`mm`/`bq`/`boost` (eDisMax tuning from §3.2), `rq` (LTR rerank from §5.4), `fl` (field list), and `debugQuery`. The choice is deliberate: the server's job is to be a stable, narrow surface that an LLM can reliably call. Letting the LLM drive eDisMax tuning per request is a footgun. If you need that flexibility, configure the parser defaults in `solrconfig.xml` and let them apply universally — the LLM never has to know.
 
 > **Production tip — narrow tools, broad config.** Resist the urge to expose every Solr knob as a tool parameter. Each parameter you expose is a chance for the LLM to set it incorrectly. Keep tool surfaces minimal and shape behavior via the collection's `solrconfig.xml` defaults. The model can still get great results — it just can't break things in novel ways.
+
+Putting tools and resources together, here is what actually happens when a user asks a question in plain English — note that the client reads the schema *resource* first, so the model builds the query from real field names instead of guessing:
+
+```{mermaid}
+%%| label: fig-06-search-tool-call
+%%| fig-cap: "An end-to-end search: the client reads the schema resource so the model uses real field names, then calls the search tool; the server validates the arguments, queries Solr through SolrJ, and the model summarises the structured result in natural language."
+sequenceDiagram
+    actor U as User
+    participant L as LLM client
+    participant M as Solr MCP server
+    participant S as Apache Solr
+    U->>L: Top 5 sci-fi shows from the 90s
+    L->>M: read resource solr://shows/schema
+    M->>S: GET schema (SolrJ)
+    S-->>M: field names and types
+    M-->>L: schema (genres, release_year, rating...)
+    L->>M: call search tool (query, filterQueries, facetFields, sortClauses)
+    M->>M: validate args against JSON-Schema
+    M->>S: SolrJ query
+    S-->>M: documents and facet counts
+    M-->>L: structured result (numFound, documents, facets)
+    L-->>U: natural-language summary, citing documents
+```
 
 ### 6.3.2 Resources — `@McpResource`
 
@@ -330,6 +434,27 @@ That's the entire user-visible API: 11 tools, 2 resources, 6 prompts, 5 completi
 ## 6.4 Transport modes: STDIO vs HTTP
 
 The server supports both MCP transports. They are not interchangeable; pick by deployment shape:
+
+```{mermaid}
+%%| label: fig-06-transports
+%%| fig-cap: "The two transports as topologies: in STDIO the client spawns the server as a child process and they share one process over stdin/stdout (one user); in HTTP one long-lived server fronts many clients over authenticated HTTPS."
+flowchart TB
+    subgraph STDIO["STDIO — local, single-user (default)"]
+        direction LR
+        subgraph Proc["one host process"]
+            direction LR
+            SC[LLM client] -->|JSON-RPC over stdin/stdout| SS[MCP server]
+        end
+        SS -->|SolrJ| SD[(Solr)]
+    end
+    subgraph HTTP["HTTP — shared service, many clients"]
+        direction LR
+        HC1[Claude Desktop] -->|HTTPS + JWT| HS["MCP server<br/>web service on :8080"]
+        HC2[Cursor] -->|HTTPS + JWT| HS
+        HC3[CI / agent] -->|HTTPS + JWT| HS
+        HS -->|SolrJ| HD[(Solr)]
+    end
+```
 
 | | STDIO | HTTP |
 |---|---|---|
@@ -565,7 +690,9 @@ sequenceDiagram
     participant Server as Solr MCP Server
     participant IdP as OAuth2 Provider
     Client->>Server: connect to /mcp
-    Server-->>Client: 401 + OAuth2 metadata URL
+    Server-->>Client: 401 + WWW-Authenticate (protected-resource metadata URL)
+    Client->>Server: GET /.well-known/oauth-protected-resource
+    Server-->>Client: authorization server (IdP) location
     Client->>IdP: discover /.well-known/oauth-authorization-server
     IdP-->>Client: authorization endpoint, token endpoint
     Client->>IdP: open browser for login + consent
@@ -611,6 +738,26 @@ Defaulting to `*` (or omitting CORS entirely) on a service that holds an OAuth2 
 
 In HTTP mode, the server emits OpenTelemetry data — traces, metrics, logs — to any OTLP collector. The reference setup uses the **Grafana LGTM stack**: **L**oki for logs, **G**rafana for the UI, **T**empo for traces, **M**imir for metrics. Everything bundled in one `grafana/otel-lgtm` Docker container, perfect for local development; in production you'd point the same OTLP exporters at your existing observability backend.
 
+```{mermaid}
+%%| label: fig-06-observability
+%%| fig-cap: "Observability in HTTP mode: each tool call emits a span (with a SolrJ child span), structured logs, and metrics via OpenTelemetry, exported over OTLP to the LGTM stack, where Grafana stitches traces, logs, and metrics into one view."
+flowchart LR
+    subgraph Server["Solr MCP server (HTTP mode)"]
+        TOOL["per-tool-call span<br/>+ SolrJ child span<br/>+ logs + metrics"]
+    end
+    TOOL -->|OTLP| LGTM
+    subgraph LGTM["grafana/otel-lgtm"]
+        direction TB
+        LOKI[(Loki — logs)]
+        TEMPO[(Tempo — traces)]
+        MIMIR[(Mimir — metrics)]
+        GRAF[Grafana dashboards]
+        LOKI --> GRAF
+        TEMPO --> GRAF
+        MIMIR --> GRAF
+    end
+```
+
 What gets traced automatically:
 
 - Every MCP tool invocation — one root span per call, with attributes for the tool name and arguments.
@@ -624,22 +771,37 @@ What this lets you debug:
 - **"Did the LLM call the tool I think it called?"** — Filter traces by tool name; the arguments are span attributes.
 - **"Are we paying for too many tool calls?"** — Mimir metrics give you tool invocation rate per minute.
 
-Standard config:
+Standard config (`application-http.properties`):
 
-```bash
-OTEL_TRACES_URL=http://localhost:4317                # OTLP gRPC endpoint
-OTEL_SAMPLING_PROBABILITY=1.0                        # 100% sampling in dev
+```properties
+# spring-boot-starter-opentelemetry auto-configures OTLP export (HTTP, port 4318)
+management.opentelemetry.tracing.export.otlp.endpoint=http://localhost:4318/v1/traces
+management.opentelemetry.logging.export.otlp.endpoint=http://localhost:4318/v1/logs
+# 100% sampling in dev; drop to 0.05–0.1 in production
+management.tracing.sampling.probability=1.0
 ```
 
-In production, drop sampling to `0.05`–`0.1` (5–10%) and point at your real OTLP collector. The server uses `@Observed` annotations (Micrometer) on every service method, plus Spring Boot's auto-instrumentation for HTTP and SolrJ — you don't have to add tracing code yourself.
+In production, drop sampling to `0.05`–`0.1` (5–10%) and point the endpoints at your real OTLP collector. Since the Spring Boot 4 / Spring AI 2.0 upgrade, traces, metrics, and OTLP log export all come from **`spring-boot-starter-opentelemetry`** — the Spring Boot 4 idiomatic OpenTelemetry starter, which replaced the older manual OTel BOM + `micrometer-tracing-bridge-otel` wiring — and the `@Observed` annotations on every service method are enabled by **`spring-boot-starter-aspectj`** (the Spring Boot 4 replacement for `spring-boot-starter-aop`), with auto-instrumentation for HTTP and SolrJ on top. You don't add tracing code yourself.
 
 ## 6.9 Implementation: Spring AI MCP, Gradle, Jib, GraalVM, Testcontainers
 
-For the Java engineer reading this book, the *how it's built* matters as much as the *how it's used*. Five implementation choices anchor the project; each one is worth understanding because each one would have been wrong if chosen carelessly.
+For the Java engineer reading this book, the *how it's built* matters as much as the *how it's used*. Six implementation choices anchor the project; each one is worth understanding because each one would have been wrong if chosen carelessly.
+
+```{mermaid}
+%%| label: fig-06-packaging
+%%| fig-cap: "One Gradle build (§6.9.2), three deployment artifacts: a Spring Boot JAR for the local STDIO loop, a Jib-built JVM image (§6.9.3) for shared HTTP deployments, and an opt-in GraalVM native image (§6.9.4) for sub-second startup."
+flowchart LR
+    G[Gradle build] --> JAR[Spring Boot JAR]
+    G --> IMG[Jib JVM image<br/>multi-arch]
+    G --> NAT[GraalVM native image<br/>opt-in: -Pnative]
+    JAR -->|java -jar, STDIO| DESK[Claude Desktop / dev loop]
+    IMG -->|HTTP, OAuth2| K8S[container / Kubernetes]
+    NAT -->|sub-second startup| EDGE[per-session STDIO / scale-to-zero]
+```
 
 ### 6.9.1 [Spring AI MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html) for the protocol
 
-Spring AI MCP (Spring AI 1.1+) is the protocol implementation. Each primitive is a Spring-bean method annotated with one of the four `@Mcp…` annotations from §6.3:
+Spring AI MCP is the protocol implementation; the server tracks **Spring Boot 4.1** and **Spring AI 2.0** — both GA on Maven Central ([Spring AI 2.0 GA, June 2026](https://spring.io/blog/2026/06/12/spring-ai-2-0-0-GA-available-now)), built and tested on JDK 25. Each primitive is a Spring-bean method annotated with one of the four `@Mcp…` annotations from §6.3 — as of Spring AI 2.0 these live in `org.springframework.ai.mcp.annotation` (folded into Spring AI core; pre-2.0 milestones used the `org.springaicommunity.mcp.annotation` community package):
 
 - `@McpTool` + `@McpToolParam` for tools (schema generated from method signature).
 - `@McpResource(uri = "…")` for resources (URI templates, path-variable binding).
