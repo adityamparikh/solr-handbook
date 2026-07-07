@@ -92,4 +92,4 @@ The "official" macOS installers (`brew install --cask quarto`, `brew install --c
 
 ## License
 
-The text is © 2026 Aditya Parikh, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Code samples are MIT unless otherwise noted.
+The book text is © 2026 Aditya Parikh, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) — see [`LICENSE`](LICENSE). The companion code under [`code/`](code/) is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) — see [`code/LICENSE`](code/LICENSE) and [`code/NOTICE`](code/NOTICE).

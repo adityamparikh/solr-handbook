@@ -55,7 +55,7 @@ The unit tests double as fact-checks — `RrfTest` reproduces the §3.6 worked R
 
 ## Diagrams
 
-All diagrams are written in [Mermaid](https://mermaid.js.org/) and rendered at build time. They diff cleanly in version control (no binary blobs), survive Markdown → PDF / HTML / EPUB conversion without hand re-rendering, and you can copy any of them into <https://mermaid.live/> to edit and adapt for your own designs.
+Most diagrams are written in [Mermaid](https://mermaid.js.org/) and rendered at build time: they diff cleanly in version control, survive Markdown → PDF / HTML / EPUB conversion without hand re-rendering, and you can copy any of them into <https://mermaid.live/> to edit and adapt for your own designs. The exceptions are a handful of figures in [Chapter 6](chapters/06-mcp.qmd) — the integration model, the architecture, the four primitives, the Skills-vs-MCP comparison, and the transport topologies — which are images adapted from the companion conference talk (credited in the Acknowledgements) and ship as raster files under `chapters/figures/`.
 
 The diagram style is intentionally consistent:
 
@@ -76,6 +76,8 @@ This book was written with Claude (Anthropic) as a drafting and review partner. 
 
 Thanks to the Apache Solr committers and the Lucene community for two decades of patient stewardship. Thanks to the authors of *Solr in Action*, *Relevant Search*, and *AI-Powered Search* — this book stands on their shoulders.
 
+Several diagrams in [Chapter 6](chapters/06-mcp.qmd) are adapted from *Talk to Solr: Natural-Language Search with MCP*, presented at Community over Code 2026 by Aditya Parikh and Eric Pugh.
+
 ---
 
 ## Copyright and edition {.unnumbered}
@@ -85,6 +87,8 @@ First edition, May 2026.
 © 2026 Aditya Parikh. Some rights reserved.
 
 This work is licensed under the [Creative Commons Attribution 4.0 International License (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). You may share and adapt the material for any purpose, including commercially, with attribution to the author.
+
+The companion source code in the [`code/`](https://github.com/adityamparikh/solr-handbook/tree/main/code) directory is licensed separately under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) — appropriate for software, and consistent with the Apache-licensed Solr ecosystem it builds on. The full license texts live in `LICENSE` (book) and `code/LICENSE` (code) in the repository.
 
 Apache®, Apache Solr™, Apache Lucene™, and Apache ZooKeeper™ are trademarks of the [Apache Software Foundation](https://www.apache.org/). Elasticsearch is a trademark of Elasticsearch B.V. OpenSearch is a trademark of the OpenSearch Software Foundation. All other trademarks are property of their respective owners. Use of trademarks in this book is descriptive only and does not imply endorsement.
 
