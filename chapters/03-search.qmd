@@ -556,8 +556,8 @@ The raw scores live on totally different scales — BM25 is unbounded positive, 
 | `MH-001` | 1 | 2 | `1/(60+1) + 1/(60+2)` | **0.03252** |
 | `BB-001` | 2 | 4 | `1/(60+2) + 1/(60+4)` | **0.03175** |
 | `BM-001` | 3 | 3 | `1/(60+3) + 1/(60+3)` | **0.03175** |
-| `SVR-001` | — | 1 | `0 + 1/(60+1)` | **0.01639** |
 | `WW-001` | 4 | 5 | `1/(60+4) + 1/(60+5)` | **0.03101** |
+| `SVR-001` | — | 1 | `0 + 1/(60+1)` | **0.01639** |
 | `BRG-001` | 5 | — | `1/(60+5) + 0` | **0.01538** |
 
 Sorted final ranking:
@@ -570,7 +570,7 @@ Sorted final ranking:
 
 **The key insight:** documents that appear in *both* lists at reasonable ranks systematically beat documents that appear in *only one* list at the top rank. Cross-retriever agreement is the strongest signal you have for relevance. This is why RRF works so well in practice despite being almost trivially simple.
 
-**Important version note.** Native Reciprocal Rank Fusion is tracked in Apache JIRA as **SOLR-17319**. The JIRA records: *"Fix Version/s: 10.1, 9.11"*. RRF is **not** in Solr 10.0.0 — you must wait for **Solr 10.1** (or Solr 9.11 on the 9.x line) for native support. When it lands it is a request-level **`combiner`** (enabled with `combiner=true` and tuned with `combiner.upTo`), *not* a query parser — so there is no `{!rrf}` to reach for. In the meantime, do RRF in your application layer (run a BM25 query and a KNN query in parallel, merge results client-side) or use the rerank pattern above.
+**Important version note.** Native Reciprocal Rank Fusion is tracked in Apache JIRA as **SOLR-17319**. The JIRA records: *"Fix Version/s: 10.1, 9.11"*. RRF is **not** in Solr 10.0.0 — you must wait for **Solr 10.1** (or Solr 9.11 on the 9.x line) for native support. What merged ([apache/solr#3418](https://github.com/apache/solr/pull/3418)) is a dedicated **`CombinedQuerySearchHandler`**: you register the handler and its `CombinedQueryComponent` in `solrconfig.xml`, send *named* sub-queries — e.g. one `edismax`, one `knn` — under a new top-level `queries` key in the JSON Query DSL, then fuse them with `combiner=true`, `combiner.query` (the list of query names to fuse), `combiner.algorithm=rrf` (the default, and the only built-in algorithm), and `combiner.rrf.k` (default 60 — the same `k` as the worked example above; the component config caps fused queries at `maxCombinerQueries`, default 5). It is *not* a query parser — there is no `{!rrf}` to reach for — and not a parameter flip on a plain `/select` request. In the meantime, do RRF in your application layer (run a BM25 query and a KNN query in parallel, merge results client-side) or use the rerank pattern above.
 
 ```java
 // Client-side RRF in SolrJ (works on Solr 10.0)
@@ -637,7 +637,7 @@ How it works:
 - `{!collapse field=franchise_id}` is a **post-filter** applied after BM25 scoring. For each value of `franchise_id`, only one representative document survives — by default the highest-scoring one. You can override with `min=release_year` (the original), `max=rating` (best-rated of the franchise), or `sort=...` for arbitrary tie-breaking.
 - The `expand` component then *re-fetches* the collapsed siblings for each surviving doc, so the UI can show "and 3 more shows in this franchise" without a second round-trip.
 
-For this example, assume the schema has been extended with a `franchise_id` field that groups related shows (e.g. all three Star Wars shows in our seed catalog — `TM-001`, `LK-001`, `AND-001` — share `franchise_id = "STAR-WARS"`; the *Better Call Saul* spinoff `BCS-001` shares `franchise_id = "BREAKING-BAD-UNIVERSE"` with `BB-001`):
+For this example, assume the schema has been extended with a `franchise_id` field that groups related shows (e.g. the two Star Wars shows in our seed catalog — `TM-001` and `AND-001` — share `franchise_id = "STAR-WARS"`, while `LK-001` sits in the Marvel group as `franchise_id = "MCU"`; the *Better Call Saul* spinoff `BCS-001` shares `franchise_id = "BREAKING-BAD-UNIVERSE"` with `BB-001`):
 
 ```text
 q=star wars
@@ -673,7 +673,7 @@ routing:          MurmurHash3("STAR-WARS") → upper bits of the 32-bit hash,
                   mapped to the shard whose hash range contains it
 ```
 
-The string before the `!` in the `id` is hashed; everything after the `!` is part of the unique identifier but ignored for routing. So `STAR-WARS!TM-001`, `STAR-WARS!LK-001`, and `STAR-WARS!AND-001` all land on the same shard. The collapse field (`franchise_id` in the example) is a **separate** field whose value matches the prefix (`"STAR-WARS"`) — you'd set both at index time.
+The string before the `!` in the `id` is hashed; everything after the `!` is part of the unique identifier but ignored for routing. So `STAR-WARS!TM-001` and `STAR-WARS!AND-001` land on the same shard (and `MCU!LK-001` on whichever shard the `MCU` prefix hashes to). The collapse field (`franchise_id` in the example) is a **separate** field whose value matches the prefix (`"STAR-WARS"`) — you'd set both at index time.
 
 > **Note on this book's seed dataset.** The 30-show table in §2.3 uses simple IDs like `ST-001` without prefix routing, because the running examples assume a single-shard dev collection. If you adapt this schema for a multi-shard production deployment and want to collapse on franchise, switch the IDs to the `FRANCHISE!showcode` form at the start, never later.
 
@@ -895,6 +895,6 @@ A mature autocomplete UX runs **both**: SuggestComponent on `/suggest` returns a
 - The JSON Facet API (Solr 5+) is the modern way to compute facets and sub-aggregations.
 - Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser; tune `topK` and `efSearchScaleFactor`.
 - Since Solr 9.8, the `language-models` module embeds text *inside* Solr — `knn_text_to_vector` at query time, `TextToVectorUpdateProcessorFactory` at index time — via OpenAI/Cohere/HuggingFace/Mistral. Mind the privacy and ingest-throughput warnings; bulk-load first, vectorise second.
-- For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** (SOLR-17319, fix versions 10.1 and 9.11).
+- For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** as the `CombinedQuerySearchHandler` (SOLR-17319, fix versions 10.1 and 9.11).
 
 ---

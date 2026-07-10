@@ -107,6 +107,8 @@ The same four primitives, organised by *who drives each one* — the model, the 
 
 ![The four MCP primitives and how Solr MCP uses each: tools (model-controlled actions like search, indexing, and schema changes), resources (application-controlled read-only context such as `solr://{collection}/schema`), prompts (user-controlled templates), and completions (user-triggered typeahead).](figures/06-mcp/mcp-primitives.png){#fig-06-primitives}
 
+> **Snapshot warning.** The primitive counts and tables in this section — 11 tools, 2 resources, 6 prompts, 5 completions — describe the Apache Solr MCP Server **as of May 2026** (the 0.x line current at this book's first edition). The server is young and moving fast; treat every hard number in §6.3 as a snapshot, and `git log` the [server repository](https://github.com/apache/solr-mcp) for what has landed since. The *design* of each primitive — what makes a good tool, resource, prompt, or completion — is the durable content here.
+
 ### 6.3.1 Tools — `@McpTool`
 
 The Solr MCP Server exposes the operations a Solr admin or app developer would otherwise drive through `curl`, the Admin UI, or SolrJ. Pin this table; it's the entire tool surface:
@@ -441,7 +443,7 @@ The Inspector is the fastest way to debug a misbehaving tool or to validate anno
 > *"Add this show to the catalog: 3 Body Problem, Netflix, sci-fi, 2024, ongoing."*
 > → Claude composes a JSON document and calls `index-json-documents`. The new doc is queryable within seconds.
 
-A real session against the live `shows` collection looks like @fig-06-mcp-claude-desktop. Note how the LLM doesn't get it right on the first try — its initial filter `platform:"Amazon Prime"` returns zero results, so it issues a *facet* query against the `platform` field, discovers the actual value is `"Amazon Prime Video"`, and re-runs with the correct filter. The corrective loop is exactly what well-designed MCP tools enable: when a query returns nothing, the LLM has the tools (facets, schema reads) to figure out *why* and recover.
+A real session against the live `shows` collection looks like @fig-06-mcp-claude-desktop. Note how the LLM doesn't get it right on the first try — its initial filter `platform:"Amazon Prime"` returns zero results, so it issues a *facet* query against the `platform` field, discovers the actual value is `"Amazon Prime Video"`, and re-runs with the correct filter. The corrective loop is exactly what well-designed MCP tools enable: when a query returns nothing, the LLM has the tools (facets, schema reads) to figure out *why* and recover. (Sharp-eyed readers will notice this demo collection's schema differs from the book's seed schema in §2.3 — `platform` singular rather than `platforms`, capitalised genre values like `Comedy` rather than lowercase — because the screenshot session ran against the Solr MCP Server's own sample data. The field-discovery loop it demonstrates is the point, and it works identically against either schema.)
 
 ![Claude Desktop turning a natural-language ask — *"give me comedies on amazon prime from my shows solr collection"* — into a chain of `search` tool calls. Claude first peeks at the schema, retries when its initial `platform:"Amazon Prime"` filter returns zero results, facets to discover the field value is actually `"Amazon Prime Video"`, then re-runs with `filterQueries=["platform:\"Amazon Prime Video\"", "genres:Comedy"]` and renders the five matches sorted by IMDb rating.](figures/06-mcp/02-claude-desktop.png){#fig-06-mcp-claude-desktop}
 

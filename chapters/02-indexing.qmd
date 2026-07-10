@@ -366,7 +366,7 @@ Every example in the rest of this book — every query, every facet, every signa
 
 : The 30-show seed catalog every example in the rest of the book draws from, spanning 8 platforms, ~20 genres, mixed languages, and a mix of ongoing, ended, and cancelled status. {#tbl-02-seed-catalog}
 
-That's 30 shows across 8 platforms, ~20 distinct genres, English and non-English titles (`Shōgun`, `Squid Game`), running and ended status, and franchise relationships (`TM-001`, `LK-001`, `AND-001` all share the Star Wars / Marvel cinematic universe — useful for the `relatedness()` aggregation in §5.5).
+That's 30 shows across 8 platforms, ~20 distinct genres, English and non-English titles (`Shōgun`, `Squid Game`), running and ended status, and franchise relationships (`TM-001` and `AND-001` share the Star Wars universe as `franchise_id = "STAR-WARS"`, while `LK-001` is Marvel — `franchise_id = "MCU"`; both groupings are useful for the `relatedness()` aggregation in §5.5).
 
 Some examples below will refer to these specific IDs. The two pairs `TO-001` / `FLG-001` (US vs. UK *Office*) and the `MH-001` / `BB-001` near-collisions on prefix `b*` are intentional — they let us demonstrate disambiguation, prefix-query cost, and editorial overrides (§5.6) on realistic data.
 
@@ -949,6 +949,34 @@ req.process(client, "shows");
 ```
 
 Caveats: an *atomic* update on a child document reindexes the entire tree from the root — expect that overhead; an *in-place* update (an eligible numeric docValues-only field, per §2.8.2) is exactly how you avoid it. And delete-by-id only works on root documents — to delete a child, use delete-by-query or an atomic remove on the parent's children pseudo-field.
+
+### 2.8.5 Querying nested documents: `{!parent}` and `{!child}` (briefly)
+
+If you do adopt the show-with-nested-episodes granularity from @tbl-02-doc-granularity, you also need the query side: the **block-join query parsers**. Nested documents are stored as a contiguous *block* in the index (children first, parent last — that's what `_root_` pins together), and the block-join parsers exploit that layout to cross levels in a single query, no application-side join.
+
+Two parsers, mirror images of each other:
+
+```text
+# Parents from children: shows with at least one episode rated ≥ 9
+q={!parent which="doc_type_s:show"}episode_rating_f:[9 TO *]
+
+# Children from parents: the episodes of every ongoing show
+q={!child of="doc_type_s:show"}status:ongoing
+```
+
+- `{!parent which=<allParents>}<childQuery>` returns **parent** documents whose children match the child query.
+- `{!child of=<allParents>}<parentQuery>` returns the **child** documents of parents matching the parent query.
+
+**The gotcha that corrupts results — `which`/`of` is a *filter*, not your search.** Both parameters must be a query that matches **every parent document in the index** (and no children) — a structural marker like `doc_type_s:show`, *not* the thing you're searching for. Putting the user's query in `which` is the classic block-join mistake; because the parser uses it to build a bitmask of parent positions, getting it wrong silently mismatches parents to other documents' children or throws cryptic `child query must only match non-parent docs` errors. Keep a dedicated discriminator field (`doc_type_s`) on every parent for exactly this purpose.
+
+To return matched parents *with* their children in one response, add the `[child]` document transformer to `fl`:
+
+```text
+q={!parent which="doc_type_s:show"}episode_rating_f:[9 TO *]
+&fl=id,title,[child limit=5 fl=id,episode_title_s]
+```
+
+That's the whole surface you need for the catalog use case. The deeper end — `childFilter` on the transformer, multi-level nesting addressed via `_nest_path_`, combining block-join with faceting (`uniqueBlock()`) — lives in the reference guide's [searching-nested-documents](https://solr.apache.org/guide/solr/latest/query-guide/searching-nested-documents.html) page. And remember the §2.2 warning before reaching for any of it: nested documents buy single-query convenience at the price of block-integrity maintenance — every tree update rewrites the whole block (§2.8.4), and a flat schema with an application-side join is often the better production trade.
 
 ## 2.9 Reindexing: when, why, and how
 

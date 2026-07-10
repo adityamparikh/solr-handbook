@@ -38,6 +38,7 @@ book:
     - part: "Back matter"
       chapters:
         - back-matter/appendix-upgrade-9-to-10.qmd
+        - back-matter/appendix-exercise-hints.qmd
         - back-matter/closing.qmd
         - back-matter/references.qmd
         - back-matter/book-index.qmd

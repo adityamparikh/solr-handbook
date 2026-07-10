@@ -133,6 +133,15 @@ public void logClick(SolrClient solr, String query, String docId,
 
 Run hourly. There are **two passes**: the rollup produces raw counts, and a second pass enriches each document with a `weight_d` that downstream consumers actually use.
 
+**First, a sixty-second Streaming Expressions primer** — because if you've never met one, the Pass 1 block below reads like Lisp that wandered into a search engine. [Streaming Expressions](https://solr.apache.org/guide/solr/latest/query-guide/streaming-expressions.html) are a functional pipeline language that runs *inside* Solr: you send an expression to a collection's `/stream` handler, and Solr executes it as a pipeline of **stream sources** (functions that emit tuples from an index — `search()`, `facet()`, `topic()`) wrapped in **stream decorators** (functions that transform another stream — `rollup()`, `select()`, `sort()`, `innerJoin()`, `update()`). Tuples flow through one at a time; the full result set is never materialised in memory. Read any expression **inside-out**:
+
+1. `search(collection, ..., qt="/export")` — the innermost *source* emits every matching document as a tuple stream. The `qt="/export"` matters: the `/export` handler streams complete sorted result sets straight off docValues (millions of rows, no pagination), where the default `/select` would stop at `rows`. The price: every field in `fl` and `sort` must have `docValues="true"`.
+2. `rollup(..., over="query_s,doc_id", count(*))` — a *decorator* that groups the incoming stream and emits one tuple per group with the aggregates. It assumes the input arrives **already sorted by the `over` fields** — that's why the inner `search` sorts by `query_s asc, doc_id asc`. Mismatch the sort and you get silently wrong counts, not an error.
+3. `select(...)` — projects and renames fields on each passing tuple, and can compute new ones (here, `concat()` builds the deterministic upsert `id`).
+4. `update(target, batchSize=...)` — the outermost decorator indexes every arriving tuple into another collection, batching as it goes.
+
+To execute, POST the expression to the source collection's stream endpoint — `curl --data-urlencode 'expr=update(...)' http://localhost:8983/solr/shows_signals/stream` — and Solr returns the tuples that flowed out of the outermost function (for an `update`, per-batch summaries). That is the entire mental model; the language has [dozens more sources and decorators](https://solr.apache.org/guide/solr/latest/query-guide/stream-source-reference.html) (joins, topics, even model scoring), but `update(select(rollup(search(...))))` is the aggregation idiom you'll reuse constantly.
+
 The `_signals_aggr` schema:
 
 ```xml
@@ -491,7 +500,6 @@ Every commercial streaming service eventually needs the "when the user types `st
   <query text="star wars">
     <doc id="AND-001" />            <!-- Editorial: critically acclaimed -->
     <doc id="TM-001"  />
-    <doc id="LK-001"  />
   </query>
 </elevate>
 ```

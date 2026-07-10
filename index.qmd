@@ -51,6 +51,7 @@ The unit tests double as fact-checks — `RrfTest` reproduces the §3.6 worked R
 - **Production tip — _xxx_.** Blue-bar callouts mark hard-won operational advice that contradicts the obvious default. Read these even if you skim the surrounding prose.
 - **Solr 9 difference — _xxx_.** Green-bar callouts mark behaviour that changed between Solr 9 and Solr 10. Skip these if you are starting fresh on Solr 10; if you are planning an upgrade, they are consolidated into a single checklist in [Appendix A](back-matter/appendix-upgrade-9-to-10.qmd).
 - **Citations.** Authoritative references (Apache Solr Reference Guide, JIRA tickets, Lucene Javadoc, published papers) are linked inline on first use and gathered in the [References](back-matter/references.qmd) section at the end of the book.
+- **Exercises.** Every chapter except Chapter 6 ends with exercises. Hints — pointers to the right section and the insight each exercise tests, not worked solutions — are gathered in [Appendix B](back-matter/appendix-exercise-hints.qmd).
 - **Figure and table numbering.** Figures and tables are numbered per chapter (`Figure 6.1`, `Table 6.3`) and cross-referenced inline. The PDF, HTML, and EPUB builds all use the same numbering.
 
 ## Diagrams
