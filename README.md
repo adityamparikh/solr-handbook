@@ -1,6 +1,6 @@
 # Apache Solr: A Practical Engineering Handbook
 
-A code-first walkthrough of Apache Solr 10 for working JVM engineers — Lucene internals, schema design, search and relevance engineering, SolrCloud operations, the Model Context Protocol integration, and an honest comparison with Elasticsearch and OpenSearch.
+A code-first walkthrough of Apache Solr 10 for working JVM engineers — Lucene internals, schema design, search and relevance engineering, SolrCloud operations, the Model Context Protocol integration, and an honest comparison with Elasticsearch and OpenSearch. Read here: https://adityamparikh.github.io/solr-handbook/
 
 This repository is the [Quarto](https://quarto.org/) source for the book **and its companion code**. The book sources produce an HTML site, a print-ready PDF, and an EPUB from a single source; the [`code/`](code/) directory is a buildable Gradle project (Solr 10.0.0, SolrJ 10.0.0, Java 21) implementing the book's examples, with unit tests and Testcontainers integration tests that run against a real Solr 10 in Docker.
 
