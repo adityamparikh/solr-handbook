@@ -20,7 +20,10 @@ References are grouped by type. Throughout the book, the first mention of any so
 - **SOLR-8261 / SOLR-8329** — BM25Similarity becomes default (Solr 6.0; the Lucene-side switch was LUCENE-6789).
 - **SOLR-9480** — `relatedness()` aggregation for JSON Faceting / Semantic Knowledge Graph.
 - **SOLR-12581** — `min_popularity` parameter for `relatedness()`.
+- **SOLR-14014** — `SOLR_UI_ENABLED` switch for disabling the Admin UI.
+- **SOLR-14070** — `CloudSolrClient.Builder` ZooKeeper-host constructor deprecation (fix version 10.1 — *not* deprecated in 10.0.0).
 - **SOLR-14656** — Autoscaling framework removed (Solr 9.0).
+- **SOLR-15150** — `update.partial.requireInPlace` request parameter (Solr 8.9 / 9.0).
 - **SOLR-17161** — SolrJ artifact split (`solr-solrj`, `solr-solrj-jetty`, `solr-solrj-zookeeper`, `solr-solrj-streaming`).
 - **SOLR-17319** — Native Reciprocal Rank Fusion (fix versions 10.1 and 9.11).
 - **SOLR-17780, SOLR-17812** — Scalar and binary quantized dense vectors.
@@ -28,17 +31,22 @@ References are grouped by type. Throughout the book, the first mention of any so
 - **SOLR-17892** — GPU-accelerated KNN via cuVS-Lucene codec.
 - **SOLR-18005** — `ConcurrentUpdateHttp2SolrClient` refactor → `ConcurrentUpdateJettySolrClient`.
 
+- **SOLR-17928** — `efSearchScaleFactor` parameter for the `knn` query parser (Solr 10.0).
+
 Browse: <https://issues.apache.org/jira/projects/SOLR>
+
+### Security advisories and CVEs
+
+- **Apache Solr security news** (the page to check before pinning a version). <https://solr.apache.org/security-news.html>
+- **19 May 2026 advisory** — *"JWT Authentication: blockUnknown default allows unauthenticated access contrary to documentation."* Affects Solr 9.0.0–9.10.1 and 10.0.0; no CVE assigned. Mitigation: set `blockUnknown` explicitly (§4.13).
+- **CVE-2026-22022** — Unauthorized bypass of certain predefined-permission rules in the `RuleBasedAuthorizationPlugin`. Fixed in 9.10.1.
+- **CVE-2026-22444** — Insufficient file-access checking in standalone core-creation requests. Fixed in 9.10.1.
 
 ### Books
 
 - Grainger, T., Turnbull, D., & Irwin, M. (2025). *AI-Powered Search.* Manning. <https://www.manning.com/books/ai-powered-search>
 - Turnbull, D., & Berryman, J. (2016). *Relevant Search: With applications for Solr and Elasticsearch.* Manning.
 - Grainger, T., & Potter, T. (2014). *Solr in Action.* Manning.
-
-### Courses
-
-- **Udemy** — *Apache Solr 8* course (slug `learn-apache-solr-8`). The published curriculum for this course was used as a coverage benchmark when auditing Chapter 2 against a typical introductory-Solr syllabus, to make sure the operator-focused material in this book also covers the foundational concepts a working engineer would otherwise pick up from such a course. <https://www.udemy.com/course/learn-apache-solr-8/>
 
 ### Papers
 

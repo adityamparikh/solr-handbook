@@ -14,7 +14,7 @@
 
 In Solr 10, *"bin/solr start now defaults to starting Solr in SolrCloud mode. Use the --user-managed switch to start in standalone (user-managed) mode instead"* (Major Changes in Solr 10). The community has been moving in this direction for years; the deprecation discussion on dev@solr.apache.org dates back to 2021.
 
-Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powered by Apache Lucene 10.3, with numerous small and large improvements."* The cluster runtime is on **Jetty 12** and **Jakarta EE 10**, the metrics subsystem migrated to **OpenTelemetry** (replacing Dropwizard), and several long-deprecated modules (jaegertracer-configurator, analytics, hadoop-auth) have been removed.
+Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powered by Apache Lucene 10.3, with numerous small and large improvements."* The cluster runtime is on **Jetty 12** and **Jakarta EE 10**, the metrics subsystem migrated to **OpenTelemetry** (replacing Dropwizard), and several long-deprecated modules — `jaegertracer-configurator`, `analytics`, `hadoop-auth` (including the Kerberos plugin), and `hdfs` — have been removed.
 
 > **Solr 9 differences — the platform shifted under your feet.** The big ones if you're upgrading from 9.x:
 > - **Java requirement.** Solr 10 server needs **Java 21**. Solr 9.x ran on Java 11+. (SolrJ on the client side still only needs Java 17 in 10.x.)
@@ -22,7 +22,7 @@ Solr 10 also upgraded its underlying engine: the Solr 10 News page states *"Powe
 > - **HTTP layer.** Jetty 12 (was 10) and Jakarta EE 10 (was `javax`). If you write custom plugins that touched servlet APIs, expect package renames (`javax.servlet.*` → `jakarta.servlet.*`).
 > - **Metrics.** Dropwizard → OpenTelemetry. Metric names changed from Dropwizard's dot-delimited style (e.g. `QUERY./select.requestTimes` with its percentile attributes) to snake_case OpenTelemetry names. Existing Prometheus dashboards will break.
 > - **`bin/solr delete`** no longer deletes a configset when you delete a collection — you must now explicitly pass `--delete-config`. In 9, a configset used by only one collection was deleted automatically.
-> - **Removed modules.** `jaegertracer-configurator`, `analytics`, `hadoop-auth`. If you used any of these, you need a replacement.
+> - **Removed modules.** `jaegertracer-configurator`, `analytics`, `hadoop-auth` (Kerberos included), and `hdfs` — HDFS-backed index storage is gone entirely. If you used any of these, you need a replacement *before* you upgrade, not after.
 >
 > The full consolidated 9→10 checklist — server, schema, SolrJ, and post-upgrade verification — is [Appendix A](../back-matter/appendix-upgrade-9-to-10.qmd).
 
@@ -81,8 +81,8 @@ The Solr 10 release notes describe SOLR-17877: *"The SolrCloud Overseer is disab
 flowchart LR
     subgraph shows [Collection shows]
       direction TB
-      sh1[shard1<br/>hash range 0 to 7FFFFFFF]
-      sh2[shard2<br/>hash range 80000000 to FFFFFFFF]
+      sh1[shard1<br/>hash range 80000000 to FFFFFFFF]
+      sh2[shard2<br/>hash range 0 to 7FFFFFFF]
     end
     sh1 --> r1a[r1 NRT leader on solr-0]
     sh1 --> r1b[r2 NRT on solr-1]
@@ -419,7 +419,7 @@ Everything so far assumed a trusted network. Out of the box, Solr has **no authe
 
 ### Rule zero: network posture
 
-Solr is a backend. It belongs behind a firewall, reachable only by your application servers and (for the admin UI) your operators' bastion or VPN — never the public internet. Authentication is the second layer, not a substitute for this one. The admin UI itself is a development tool: front it with an authenticating reverse proxy in production, or disable it with `SOLR_OPTS="-Dsolr.ui.enabled=false"` (§2.0).
+Solr is a backend. It belongs behind a firewall, reachable only by your application servers and (for the admin UI) your operators' bastion or VPN — never the public internet. The reference guide does not hedge: *"No Solr API, including the Admin UI, is designed to be exposed to non-trusted parties."* Authentication is the second layer, not a substitute for this one. Solr helps by binding only to the loopback interface unless you widen it with `SOLR_HOST_BIND` (same for embedded ZooKeeper via `SOLR_ZOOKEEPER_EMBEDDED_HOST`) — a default worth preserving as long as you can. The admin UI itself is a development tool: front it with an authenticating reverse proxy in production, or turn it off with `SOLR_UI_ENABLED=false` in `solr.in.sh` (§2.0).
 
 ### `security.json`: authentication + authorization in one file
 
@@ -449,18 +449,22 @@ Solr's whole security configuration lives in a single document, `security.json`,
 
 The pieces worth understanding rather than copying:
 
-- **`blockUnknown: true`** (the default when omitted) rejects every unauthenticated request. Setting it to `false` is a trap: any request not explicitly matched by a permission becomes anonymous-accessible.
+- **`blockUnknown: true`** rejects every unauthenticated request. **Always write it explicitly — do not rely on the default.** The reference guide has documented the default as `true` since Solr 9.0, but Solr's own [security advisory of 19 May 2026](https://solr.apache.org/security-news.html) records that for the **JWT Authentication Plugin** the *code* default has always been `false`, in every release from 9.0.0 through 9.10.1 and in 10.0.0: *"The Reference Guide has documented this as defaulting to `true` since Solr 9.0, but the code default has always been `false`."* Clusters that omitted the setting were silently accepting anonymous requests. Solr 9.11 and 10.1 change the code default to `true`; until then, the mitigation is one line of `security.json`. Setting it to `false` deliberately is a separate trap: any request not explicitly matched by a permission becomes anonymous-accessible.
 - **Password encoding** is `base64(sha256(sha256(salt+password)))` followed by `base64(salt)`, space-separated. You rarely compute this by hand — bootstrap with the documented example user, then manage real users through the API below, which hashes server-side.
-- **`forwardCredentials: false`** lets Solr's internal PKI authentication handle node-to-node requests instead of forwarding the user's Basic header — the right default.
+- **`forwardCredentials: false`** lets Solr's internal PKI authentication handle node-to-node requests instead of forwarding the user's Basic header. Set it explicitly, as with `blockUnknown` — an undocumented default is a default you shouldn't be relying on.
 - **Permissions are evaluated top-down, and the catch-all rule is permissive:** an authenticated request that matches *no* permission is **allowed**. That's why the example pins `update` to the `admin` role — without it, any authenticated user could write. If you want default-deny for authenticated users too, add `{"name": "all", "role": "admin"}` as the *last* permission. The predefined permission names (`read`, `update`, `security-edit`, `schema-edit`, `config-edit`, `collection-admin-edit`, `metrics-read`, `health`, …) are in the [Rule-Based Authorization reference](https://solr.apache.org/guide/solr/latest/deployment-guide/rule-based-authorization-plugin.html).
+
+> **Patch level is part of your security posture.** Two moderate-severity CVEs published in 2026 land squarely on the configuration above: **CVE-2026-22022**, an unauthorized bypass of certain *predefined permission* rules in the `RuleBasedAuthorizationPlugin` — i.e. exactly the `{"name": "read", "role": [...]}` style rules this section recommends — and **CVE-2026-22444**, insufficient file-access checking in standalone core-creation requests. Both are fixed in Solr 9.10.1. Check [solr.apache.org/security-news.html](https://solr.apache.org/security-news.html) before you pin a version, and treat "we're on the latest patch release" as part of the same checklist as `blockUnknown`. A permission model is only as good as the code enforcing it.
 
 ### Deploying and changing it
 
 Upload once to ZooKeeper and the cluster picks it up live — no restart:
 
 ```bash
-bin/solr zk cp ./security.json zk:security.json -z localhost:2181
+bin/solr zk cp file:./security.json zk:/security.json -z localhost:2181
 ```
+
+Both operands are scheme-qualified — `file:` for the local path, `zk:` with a **leading slash** for the ZooKeeper path. Omitting either is the usual reason a "successful" upload lands nowhere useful.
 
 After that, **edit through the APIs, not the file**. The Authentication and Authorization APIs hash passwords for you and update the live configuration atomically:
 
@@ -529,6 +533,7 @@ The `/admin/metrics` API now defaults to Prometheus exposition format. Pipe it i
 - Three replica types — NRT, TLOG, PULL — let you trade indexing latency vs. CPU and high-availability.
 - The Collections API in SolrJ is your control plane for creating, splitting, reloading collections.
 - The removed autoscaling framework is replaced by **Replica Placement Plugins** + external orchestration (Kubernetes Operator + HPA).
+- **Solr ships with no security at all.** Firewall first, then `security.json`; write `blockUnknown: true` and `forwardCredentials: false` out explicitly rather than trusting documented defaults (§4.13 — Solr's own May 2026 advisory is about exactly that gap), test *authorization* as well as authentication, and track [security-news](https://solr.apache.org/security-news.html) as part of your version-pinning decision.
 - Production Kubernetes deployment uses the **Apache Solr Operator** (current GA: v0.9.1; v0.10.x with first-class Solr 10 support is in development) with an externally-managed ZooKeeper ensemble, persistent storage, pod anti-affinity, and OpenTelemetry/Prometheus monitoring.
 
 ---

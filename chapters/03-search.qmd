@@ -4,7 +4,7 @@
 >
 > **Prerequisites:** Chapter 1 (inverted index, query types, cost model) and Chapter 2 (you need a schema and an index to query against).
 >
-> **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search and HNSW work, with a worked cosine-similarity example; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
+> **You will learn:** How a Solr query is composed from `q`, `fq`, `fl`, `sort`, and friends; which caches each part of a request touches and how post-filters change the order of work; why eDisMax is the right default parser for user-facing search; how to use the JSON Facet API for modern aggregations; how BM25 actually scores; how vector search and HNSW work, with a worked cosine-similarity example; how to combine lexical and vector retrieval via Reciprocal Rank Fusion; how to debug "why is this result first?" in production; and how to build query and document autocomplete.
 >
 > **What you should not skip:** §3.5 (BM25 in honest detail) and §3.6 (vector search and hybrid retrieval — the future of every search bar).
 >
@@ -48,6 +48,46 @@ sequenceDiagram
     SH-->>N: NamedList
     N-->>C: JSON
 ```
+
+### `q` vs. `fq`, and the caches behind them
+
+The single most consequential line in that table is the difference between `q` and `fq`, because it decides what Solr can cache. A clause in `q` contributes to the score, so its result depends on the whole query and can't be reused. A clause in `fq` only restricts the result set — same filter, same documents, every time — so Solr stores the matching doc-id set in the **filterCache** and reuses it across every subsequent request that asks for the same filter string, byte for byte.
+
+That "byte for byte" is the part people get wrong. `fq=status:ongoing` and `fq=status:"ongoing"` are two cache entries. `fq=added_at:[NOW-7DAYS TO NOW]` is a *new* cache entry on every request, because `NOW` resolves to the current millisecond — round it (`NOW/DAY-7DAYS TO NOW/DAY`) and one entry serves the whole day.
+
+Three caches matter, all configured in `solrconfig.xml` under `<query>` and all reported per-collection in `/admin/metrics` (§4.14):
+
+| Cache | Key → value | Sized by | The number to watch |
+|---|---|---|---|
+| `filterCache` | filter query → doc-id set | number of *distinct* `fq` strings in flight | hit ratio; also **eviction rate** — steady evictions mean it's too small or your filters aren't reusable |
+| `queryResultCache` | (query, filter set, sort) → an ordered *window* of doc-ids, sized by `queryResultWindowSize` | number of distinct query+filter+sort combinations | hit ratio; near-zero is normal and fine on long-tail search |
+| `documentCache` | doc-id → stored fields | `rows` × concurrent requests | should be sized at least `rows × max concurrent queries`; it is **never autowarmed** (doc-ids change on every commit) |
+
+: The three Solr caches a search request touches, what each one keys on, and the metric that tells you whether it's earning its memory. {#tbl-03-caches}
+
+**Autowarming** is the other half. On a new searcher (every soft commit, §2.10), Solr can re-execute the top-N entries of the previous searcher's `filterCache` and `queryResultCache` to populate the new one — that's `autowarmCount`. It is not free: warming happens *before* the searcher goes live, so an `autowarmCount` of 512 against a 1-second soft-commit interval means you are permanently warming rather than serving. Start at `0`–`64` and raise it only if you measure a post-commit latency spike.
+
+Two local params override the default behaviour per filter:
+
+- **`{!cache=false}`** — don't cache this filter, and don't consult the cache. Correct for filters that are unique per request (a per-user ACL list, a bounding box, a `NOW`-anchored range you can't round). Caching those just evicts the filters that *would* have been reused.
+- **`{!cache=false cost=100}`** — at `cost` ≥ 100 an uncached filter that implements Solr's post-filter interface becomes a **post-filter**: instead of building a full doc-id set up front, it is consulted per document *after* the query and cheaper filters have already narrowed the candidates. This is the right shape for expensive predicates — `{!frange}` over a function, an expensive spatial check, `{!collapse}` (§3.9, which is always a post-filter). Ordering among post-filters follows ascending `cost`, so put the cheap-and-selective one first.
+
+```text
+&fq=platforms:Netflix                                   # cached, reused everywhere
+&fq={!cache=false}added_at:[NOW-3600SECONDS TO NOW]      # unique per request, don't pollute the cache
+&fq={!frange l=0.8 cache=false cost=200}popularity       # expensive: evaluate last, per surviving doc
+```
+
+> **Production tip — a low `filterCache` hit ratio is a *design* signal, not a sizing signal.** Before enlarging the cache, look at what's actually being cached. Nine times out of ten the fix is rounding a date, hoisting a per-user predicate into `{!cache=false}`, or normalising the filter string your application generates so the same logical filter always produces the same bytes.
+
+### Pagination, and the two ways to go deep
+
+`start`/`rows` is fine for the first few pages and quadratically bad after that: a distributed request for `start=100000&rows=10` makes *every shard* return its top 100,010 documents so the aggregator can merge and discard 100,000 of them. Two alternatives:
+
+- **`cursorMark`** (§2.9.4) — constant cost per page, requires a sort ending in the `uniqueKey`, and gives you a stateless "next page" token. This is what you want for exports, reindexes, and any "scroll through everything" API.
+- **The `/export` handler** — streams a complete sorted result set off docValues with no pagination at all. Used by Streaming Expressions (§5.2); every field in `fl` and `sort` must have `docValues="true"`.
+
+For user-facing search, cap `rows` in your application (100 is a generous ceiling) and pair it with **`timeAllowed`** — a per-request millisecond budget after which Solr returns what it has and sets `partialResults: true` in the response header. It is a latency guard, not a correctness guarantee: your code must check the flag and decide whether a partial answer is acceptable. In SolrCloud, `shards.tolerant=true` plays the same role for *availability* — the request succeeds with results from the shards that answered instead of failing outright when one is down. Both are opt-in, and both mean your response handling has to look at the header.
 
 ## 3.2 Query parsers: Standard, DisMax, eDisMax
 
@@ -130,7 +170,7 @@ SolrDocumentList docs = resp.getResults();
 Solr exposes faceting in three ways:
 
 1. **Legacy field/range/query/pivot facets** via `facet.*` params. Simple, flat.
-2. **JSON Facet API** (recommended). Nested, composable, supports aggregations like `avg`, `percentile`, `unique`. First shipped in Solr 5.1, per Yonik Seeley's original announcement on yonik.com (April 17, 2015): *"Solr 5 has a completely re-written faceted search and analytics module with a structured JSON API."*
+2. **JSON Facet API** (recommended, and the one to learn). Nested, composable, and it supports real aggregations — `avg`, `sum`, `percentile`, `unique`, `relatedness()` (§5.5) — not just counts. Shipped in Solr 5.1.
 3. **Pivot facets** for hierarchical multi-field facets (the JSON API supersedes most uses).
 
 ### Legacy field facet
@@ -363,6 +403,36 @@ Approximate, not exact — the algorithm trades a small amount of recall for ord
 
 The main knobs you have on HNSW are graph density at build time, build-time search effort, and query-time search effort. Defaults work well for most workloads; the [Solr Dense Vector Search reference](https://solr.apache.org/guide/solr/latest/query-guide/dense-vector-search.html) covers all of them. For the algorithm itself, the original paper by Malkov & Yashunin ("[Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320)") is the canonical reference.
 
+### Filtering a KNN query: pre-filter vs. post-filter, and ACORN
+
+Real vector queries almost never run unfiltered — "shows like this one, **on Netflix**, **still running**" is the norm. And *where* the filter is applied relative to the graph walk is the single biggest production gotcha in Solr vector search, because the two orders give different results, not just different speeds:
+
+- **Pre-filter**: restrict the HNSW walk to documents that pass the filter, *then* find the top-K among them. You always get `topK` valid results (if that many exist).
+- **Post-filter**: find the global top-K first, *then* throw away the ones that fail the filter. If your user wanted Netflix and the 10 nearest neighbors are all on Max, you return **zero results** — with nothing wrong in the logs.
+
+Solr's defaults depend on *the position of `{!knn}` in the request*, and this is the part to commit to memory. When `{!knn}` is the **main query**, `fq` filters are pre-filters — the reference guide: *"fq filters in the request (that are not Solr Post Filters) will be combined to form an implicit Graph Pre-Filter."*
+
+```text
+q={!knn f=embedding topK=10}[0.012, -0.183, ..., 0.044]
+&fq=platforms:Netflix
+&fq=status:ongoing        # both fq's pre-filter the graph walk — 10 valid results
+```
+
+But when `{!knn}` is itself an `fq`, or a clause inside a boolean query, **no implicit pre-filter is applied** — the graph walk runs against the whole index and composes with everything else afterwards. Same-looking request, silently different semantics:
+
+```text
+q=status:ongoing
+&fq={!knn f=embedding topK=10}[...]   # walk ignores status; may intersect to < 10 results
+```
+
+Three local params give you explicit control:
+
+- **`preFilter`** — name the pre-filter queries yourself, overriding the implicit behavior. Multi-valued (repeat the param or use parameter references), works in *any* position, and `preFilter=""` disables pre-filtering entirely — the escape hatch when you *want* global nearest neighbors annotated by cheap post-filters.
+- **`includeTags` / `excludeTags`** — keep the implicit behavior but select *which* `fq`s participate, by [tag](https://solr.apache.org/guide/solr/latest/query-guide/common-query-parameters.html): `q={!knn f=embedding topK=10 includeTags=for_knn}[...]&fq=platforms:Netflix&fq={!tag=for_knn}status:ongoing` pre-filters the walk on `status` only, while `platforms` applies as an ordinary independent filter. Two hard constraints: they are valid **only** when `{!knn}` is the main `q`, and they **must not be combined with `preFilter`** — pick one mechanism or the other.
+- **`filteredSearchThreshold`** — new in Solr 10 ([SOLR-17815](https://issues.apache.org/jira/browse/SOLR-17815)): *how* the pre-filtered walk executes. A restrictive pre-filter degrades vanilla HNSW badly — the walk keeps arriving at neighbors the filter rejects and has to push further and further out. Below the threshold (the percentage of documents passing the filter, 0–100; the guide suggests `60`), Solr switches to **ACORN**, a filter-aware traversal that hops through rejected nodes' neighborhoods instead of stalling on them. `q={!knn f=embedding topK=10 filteredSearchThreshold=60}[...]` is cheap insurance on any query whose filters can get selective.
+
+> **Production tip — decide filter placement per use case, then write it down.** "Similar shows, filtered to what the user can watch" wants pre-filtering (the default main-query behavior — leave it alone). "Global semantic matches, badged by availability" wants `preFilter=""` plus normal `fq` post-filters. The failure mode of guessing wrong is not an error; it's empty or subtly-wrong result pages under exactly the filter combinations you didn't test. Solr 10.0 also adds `earlyTermination`, `saturationThreshold`, and `patience` params for cutting off unproductive walks — leave them at defaults until you have recall measurements (§5.1) to judge the trade.
+
 ### Cosine similarity, with an example
 
 The HNSW graph walk finds candidates close to the query, but "close" needs a distance metric. The most common for embedding vectors is **cosine similarity**: it measures the *angle* between two vectors, ignoring their magnitudes.
@@ -413,7 +483,7 @@ For the underlying math, see the [Wikipedia article on cosine similarity](https:
 
 The Solr 10.0 release notes explicitly list, as new features: *"Scalar and binary quantized dense vectors are now supported for DenseVectorField (SOLR-17780, SOLR-17812). Quantization reduces memory consumption and can improve search performance at some cost to accuracy."* And: *"GPU-accelerated approximate nearest neighbor search is now available via the cuVS-Lucene pluggable codec (SOLR-17892)."*
 
-A binary-quantized field (1 bit per dimension instead of 32):
+Quantization arrives as two new field-type classes that subclass `DenseVectorField`. A binary-quantized field stores 1 bit per dimension instead of 32:
 
 ```xml
 <fieldType name="binary_quantized_vector" class="solr.BinaryQuantizedDenseVectorField"
@@ -421,7 +491,19 @@ A binary-quantized field (1 bit per dimension instead of 32):
 <field name="embedding_bq" type="binary_quantized_vector" indexed="true" stored="true"/>
 ```
 
-This reduces memory footprint roughly 32× at a measured accuracy cost — appropriate for very large vector corpora.
+This reduces the resident memory footprint roughly 32× at a measured accuracy cost — appropriate for very large vector corpora. It takes the same attributes as `DenseVectorField` **except `similarityFunction`**, because binary quantization uses its own distance computation. For a gentler trade, `solr.ScalarQuantizedDenseVectorField` (SOLR-17780) quantizes to 7 bits (default) or 4 bits per dimension and *does* accept `similarityFunction`.
+
+The GPU path is a different axis: the cuVS-Lucene pluggable codec is selected by setting `knnAlgorithm="cagra_hnsw"` on the field type (CAGRA is NVIDIA's GPU-built graph index; Solr builds it on the GPU and searches an HNSW view of it). It needs the codec on the classpath and a supported GPU — see §7.6 for the honest maturity assessment before you plan around it.
+
+### `{!vectorSimilarity}` — "everything closer than X", not "the nearest K"
+
+`{!knn}` answers "give me the `topK` nearest," which always returns `topK` documents no matter how bad the last one is. Sometimes the question is the other way round: *"every show whose embedding is at least this similar, however many that is."* That's `{!vectorSimilarity}`:
+
+```text
+q={!vectorSimilarity f=embedding minReturn=0.8}[0.012, -0.183, ..., 0.044]
+```
+
+It returns every document at or above the `minReturn` threshold — zero documents if nothing qualifies. (An optional `minTraverse`, default `-Infinity`, separately bounds how far the graph walk will wander; it takes the same `preFilter` / `includeTags` / `excludeTags` params as `{!knn}`.) Reach for it when a weak match is worse than no match: "more like this" rails that should stay empty rather than show junk, de-duplication, and near-duplicate detection. Reach for `{!knn}` when the UI has N slots to fill regardless.
 
 ### Text-to-vector inside Solr: the `language-models` module (Solr 9.8+)
 
@@ -712,9 +794,9 @@ Other transformers that earn their keep:
 | `[explain]` or `[explain style=nl]` | Per-doc score derivation | Triaging "why is this ranked here" |
 | `[shard]` | The shard the doc came from | Triaging "why does this query miss in production but hit on a single-node dev cluster" |
 | `[docid]` | Internal Lucene doc-id | Catching segment-merge artifacts; almost never useful in app code |
-| `[features store=v1]` | LTR feature vector at request time | Logging features for offline model training (see Ch 6) |
-| `[child]` | Nested children for block-join queries | Validating nested-document indexing |
-| `[elevated]` / `[excluded]` | Boolean flag for QueryElevation hits | UI badges showing editorial overrides (see Ch 6) |
+| `[features store=v1]` | LTR feature vector at request time | Logging features for offline model training (§5.4) |
+| `[child]` | Nested children for block-join queries | Validating nested-document indexing (§2.8.5) |
+| `[elevated]` / `[excluded]` | Boolean flag for QueryElevation hits | UI badges showing editorial overrides (§5.6) |
 
 : The document transformers worth knowing in production, what each one adds to the response, and when reaching for it actually saves you time. {#tbl-03-doc-transformers}
 
@@ -891,9 +973,12 @@ A mature autocomplete UX runs **both**: SuggestComponent on `/suggest` returns a
 ## 3.12 Chapter summary
 
 - Default to **eDisMax** for any user-facing search. Master `qf`, `pf`, `mm`, `tie`, `bq`, `boost`.
+- **Put anything unscored in `fq`** so the `filterCache` can reuse it, and keep the filter string byte-identical across requests (round `NOW`!). Mark per-request filters `{!cache=false}`, and give expensive predicates `cost≥100` so they run as post-filters against an already-narrowed candidate set.
+- **Don't deep-page with `start`/`rows`.** Use `cursorMark` (or `/export`) for scrolling, cap `rows` in the application, and guard latency with `timeAllowed` / availability with `shards.tolerant` — checking `partialResults` in the response header.
 - BM25 is the default similarity (since Solr 6); tune `k1` and `b` only with measured relevance metrics in hand.
 - The JSON Facet API (Solr 5+) is the modern way to compute facets and sub-aggregations.
-- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via cuVS. Use the `knn` parser; tune `topK` and `efSearchScaleFactor`.
+- Vector search in Solr 10 is mature: HNSW with scalar/binary quantization and (optional) GPU acceleration via the cuVS codec (`knnAlgorithm="cagra_hnsw"`). Use the `knn` parser for "top K", `vectorSimilarity` for "everything above a threshold"; tune `topK` and `efSearchScaleFactor`.
+- **Know your filter placement.** `fq`s pre-filter the graph walk when `{!knn}` is the main query, but **not** when it's an `fq` or boolean clause — control explicitly with `preFilter`/`includeTags`/`excludeTags`, and set `filteredSearchThreshold` (ACORN, new in 10) when filters get selective.
 - Since Solr 9.8, the `language-models` module embeds text *inside* Solr — `knn_text_to_vector` at query time, `TextToVectorUpdateProcessorFactory` at index time — via OpenAI/Cohere/HuggingFace/Mistral. Mind the privacy and ingest-throughput warnings; bulk-load first, vectorise second.
 - For hybrid retrieval **today on 10.0.0**, use the rerank pattern or client-side RRF. Native RRF lands in **Solr 10.1** as the `CombinedQuerySearchHandler` (SOLR-17319, fix versions 10.1 and 9.11).
 

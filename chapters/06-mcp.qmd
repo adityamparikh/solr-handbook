@@ -303,26 +303,20 @@ The Solr MCP Server now ships **five** completions — every one of which sugges
 
 : The five `@McpComplete` handlers. All complete collection names from the live cluster; they exist as separate handlers because MCP registers one completion per `(reference, argument-name)` pair — a resource handler does **not** transparently cover a prompt argument of the same name. {#tbl-06-completions}
 
-The single shared implementation:
+The single shared implementation — five thin `@McpComplete` wrappers, one per binding, all delegating to one helper:
 
 ```java
 @McpComplete(uri = "solr://{collection}/schema")
 public List<String> completeForSchemaResource(CompleteRequest.CompleteArgument arg)
         throws SolrServerException, IOException {
-    return completeCollection(arg);
-}
-
-@McpComplete(prompt = PromptNames.SEARCH_COLLECTION)
-public List<String> completeForSearchPrompt(CompleteRequest.CompleteArgument arg)
-        throws SolrServerException, IOException {
-    return completeCollection(arg);              // …and three more identical wrappers
+    return completeCollection(arg);              // …and four more identical wrappers
 }
 
 private List<String> completeCollection(CompleteRequest.CompleteArgument arg)
         throws SolrServerException, IOException {
-    if (!"collection".equals(arg.name())) return List.of();
+    if (!"collection".equals(arg.name())) return List.of();   // guard: only this argument
     String prefix = arg.value() == null ? "" : arg.value().toLowerCase(Locale.ROOT);
-    return listCollections().stream()
+    return listCollections().stream()                          // same data path as the tool
         .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
         .sorted()
         .limit(MAX_COMPLETION_RESULTS)        // 100 — MCP completion budget
@@ -330,13 +324,11 @@ private List<String> completeCollection(CompleteRequest.CompleteArgument arg)
 }
 ```
 
-A handful of design points worth pinning:
+Three design points worth pinning:
 
-- **One handler per `(reference, argument-name)` pair.** This is the reason there are five thin handlers rather than one. MCP dispatches `completion/complete` by the *reference* being completed (a specific resource URI template, or a specific prompt) **and** the argument name. Binding to the `solr://{collection}/schema` resource does nothing for the `collection` argument of the `/search-collection` prompt — that's a different reference. So the server registers a wrapper per surface and funnels them all to one helper.
-- **Guard on the argument name.** Each handler still checks `arg.name()` before doing work, so it only fires for the `collection` variable even if a prompt later grows a second argument.
-- **Filter by prefix, sort stably, cap the response.** The MCP spec budgets a small list of completions per request; sending 10,000 collection names is both wasteful and unusable. 100, sorted, lowercase-prefix-filtered is the sweet spot.
-- **Re-use the underlying tool's data path.** Every completion calls the same `listCollections()` that the `list-collections` tool calls. One data path, six surfaces; no separate cache, nothing to invalidate.
-- **Not everything gets a completion.** `setup-collection`'s `name` argument is deliberately *not* completed — it names a collection that does not exist yet, so suggesting existing names would be actively misleading. `explore-collections` takes no arguments at all. Completion is for picking from a known set, not for inventing a new value.
+- **One handler per `(reference, argument-name)` pair** — the reason there are five wrappers and not one. MCP dispatches `completion/complete` by the *reference* being completed (a specific resource URI template, or a specific prompt) **and** the argument name. Binding to the `solr://{collection}/schema` resource does nothing for the `collection` argument of the `/search-collection` prompt; that's a different reference.
+- **Guard, sort, cap.** The argument-name check keeps the handler quiet if a prompt later grows a second argument. The MCP spec budgets a small list per request, so cap it — 100, sorted, prefix-filtered.
+- **Not everything gets a completion.** `setup-collection`'s `name` argument is deliberately *not* completed: it names a collection that does not exist yet, so suggesting existing names would be actively misleading. Completion is for picking from a known set, not for inventing a new value.
 
 > **Tool vs Completion — when each wins.** A *tool* is for the LLM. A *completion* is for the *client's typeahead UI*. They can be backed by the same underlying call; the distinction is who's consuming the result. If only your LLM ever needs the data, skip completion — `list-collections` already covers that. Add completion when a human user types into a picker — and add one *per surface*, because each prompt argument and each resource variable is its own MCP reference.
 
@@ -364,7 +356,7 @@ The server supports both MCP transports. They are not interchangeable; pick by d
 
 **Use HTTP when** you have multiple users sharing one Solr cluster (a team's internal search assistant), when you need OAuth2, when you need traces and metrics, or when you want to deploy the MCP server in Kubernetes alongside the SolrCloud cluster from §4.12.
 
-> **Why no observability on STDIO?** The MCP STDIO protocol uses stdout as the wire. Anything else printed to stdout — log lines, trace exporters, anything — corrupts the protocol stream. The server suppresses all stdout output in STDIO mode. This is also why the JVM Docker image is built with [Jib](https://github.com/GoogleContainerTools/jib) instead of [Spring Boot Buildpacks](https://docs.spring.io/spring-boot/reference/packaging/container-images/cloud-native-buildpacks.html) (§6.9): Paketo's `libjvm` runtime helpers print ~6 status lines to stdout *on every container start*, before the JVM, breaking the JSON-RPC handshake (filed upstream as [paketo-buildpacks/libjvm#482](https://github.com/paketo-buildpacks/libjvm/issues/482)).
+> **Why no observability on STDIO?** The MCP STDIO protocol uses stdout as the wire. Anything else printed there — log lines, trace exporters, a JVM banner — corrupts the protocol stream, so the server suppresses all stdout output in STDIO mode. This constraint reaches further than you'd expect; it also dictates how the container image is built (§6.9.3).
 
 > **Debugging tip — point [MCP Inspector](https://github.com/modelcontextprotocol/inspector) at HTTP mode.** Inspector is the protocol-level browser for MCP: it lists every tool, resource, prompt, and completion the server exposes, shows the JSON schemas, lets you call them with arbitrary inputs, and dumps the JSON-RPC traffic. Always exercise a new tool/prompt/completion in Inspector against HTTP mode before touching a real client — you'll see the schema and error responses without an LLM in the loop.
 
@@ -546,7 +538,7 @@ In STDIO mode the server is a child process of the MCP client. The client launch
 
 That's why the chapter shows STDIO config like `docker run -i --rm …` with no token, no API key, no header. The MCP client (Claude Desktop, Claude Code, VS Code, Cursor, JetBrains) is the trust boundary. If a malicious extension can spawn a Docker container as the user, you've already lost — not because of MCP, but because untrusted code is running locally.
 
-The one STDIO-specific failure mode worth knowing: **anything the server prints to stdout corrupts the protocol stream**. Logs, banners, accidental `System.out.println` calls — they all become unparseable JSON-RPC and the client disconnects. The server suppresses console logging entirely in STDIO mode (an empty console pattern, no appenders in the stdio logging profile, banner off), and the JVM Docker image is built with [Jib](https://github.com/GoogleContainerTools/jib) (§6.9) rather than [Buildpacks](https://docs.spring.io/spring-boot/reference/packaging/container-images/cloud-native-buildpacks.html) precisely because Paketo's `libjvm` launch helpers write status lines to stdout on every container start ([libjvm#482](https://github.com/paketo-buildpacks/libjvm/issues/482)). STDIO doesn't need auth, but it does need stdout hygiene.
+The one STDIO-specific failure mode worth knowing: **anything the server prints to stdout corrupts the protocol stream**. Logs, banners, accidental `System.out.println` calls — they all become unparseable JSON-RPC and the client disconnects. The server suppresses console logging entirely in STDIO mode (an empty console pattern, no appenders in the stdio logging profile, banner off), and the same constraint drives the container-image choice in §6.9.3. STDIO doesn't need auth, but it does need stdout hygiene.
 
 ### 6.7.2 HTTP: OAuth2 with JWT validation
 
@@ -752,47 +744,11 @@ That tested-version matrix is the only credible way to know whether the MCP serv
 
 ### 6.9.6 [CycloneDX](https://cyclonedx.org/) SBOM for supply-chain transparency
 
-An MCP server sits in a privileged spot: it holds Solr credentials, runs arbitrary queries on the LLM's behalf, and (in HTTP mode) is network-exposed. Anyone deploying it has a right to ask *exactly what's inside the artifact* — every transitive dependency, with versions, so they can scan it against CVE feeds. That's what a **Software Bill of Materials (SBOM)** is for, and the project is adding one via the **[CycloneDX](https://cyclonedx.org/) Gradle plugin** ([`org.cyclonedx.bom`](https://github.com/CycloneDX/cyclonedx-gradle-plugin), version 2.4.1 — the version Spring Initializr pairs with the Spring Boot `sbom-cyclone-dx` starter).
+An MCP server sits in a privileged spot: it holds Solr credentials, runs queries on the LLM's behalf, and (in HTTP mode) is network-exposed. Anyone deploying it has a right to ask *exactly what's inside the artifact*, so they can scan it against CVE feeds. That's what a **Software Bill of Materials (SBOM)** is for.
 
-> **Note — landing via an open PR.** As of this writing the SBOM work is in flight as an open pull request, not yet merged to `main`. The mechanism below is what it introduces; treat the exact paths as current-as-proposed and check the repo for the merged form.
+The mechanism is one line of build script. Applying the [CycloneDX](https://cyclonedx.org/) Gradle plugin (`org.cyclonedx.bom`) alongside Spring Boot gets you a CycloneDX JSON document from `./gradlew cyclonedxBom`, and Spring Boot's own integration does the rest: `bootJar` gains a dependency on the SBOM task and embeds the result at `META-INF/sbom/application.cdx.json` *inside* the jar. That matters more than the file itself — the SBOM travels with the artifact into every image flavour (§6.9.3–6.9.4) rather than being a side file someone has to remember to ship. Setting `management.endpoint.sbom.enabled=true` additionally exposes it at `GET /actuator/sbom/application`, so a deployed fleet can hand a scanner its own manifest. Either way, consumers scan it directly with `trivy sbom application.cdx.json` or `grype sbom:application.cdx.json`.
 
-The wiring is deliberately minimal. The plugin is declared in the version catalog and applied with no explicit configuration block — it leans entirely on Spring Boot's CycloneDX auto-configuration, which is what keeps the format and output path predictable:
-
-```toml
-# gradle/libs.versions.toml
-[versions]
-cyclonedx-plugin = "2.4.1"
-
-[plugins]
-cyclonedx = { id = "org.cyclonedx.bom", version.ref = "cyclonedx-plugin" }
-```
-
-```kotlin
-// build.gradle.kts — one line in the plugins block; no cyclonedxBom { } config
-plugins {
-    alias(libs.plugins.cyclonedx)
-}
-```
-
-That gives you a **CycloneDX JSON 1.6** document, generated by the standard `cyclonedxBom` task:
-
-```bash
-./gradlew cyclonedxBom        # → build/reports/application.cdx.json
-```
-
-Four things fall out of the Spring Boot integration, and together they're why this is more than a CI checkbox:
-
-- **Embedded in the bootable JAR.** The Spring Boot Gradle plugin makes `bootJar` depend on `cyclonedxBom` and bundles the result at `META-INF/sbom/application.cdx.json` inside the jar. The SBOM travels *with* the artifact, not as a side file someone has to remember to ship.
-- **Free coverage for every image flavour.** Because the Jib JVM image and both Paketo native images (§6.9.3–6.9.4) package the same bootJar contents, the embedded SBOM rides along into all three — no per-image wiring. (The plugin reports the Gradle dependency graph, which is what ends up in the GraalVM binary too, so the native images are covered by the same manifest.)
-- **Served at runtime, HTTP mode only.** With `management.endpoint.sbom.enabled=true`, the Actuator exposes the SBOM at `GET /actuator/sbom/application` (content type `application/vnd.cyclonedx+json`). A running server can hand a scanner its own bill of materials — handy for a deployed fleet you want to audit live.
-- **Attached to releases and CI artifacts.** The release workflow runs `./gradlew cyclonedxBom`, uploads `application.cdx.json` as a build artifact, and attaches it to the GitHub Release as `solr-mcp-<version>.cdx.json`; the build workflow uploads it on every run. Consumers can scan the SBOM directly:
-
-```bash
-trivy sbom application.cdx.json          # CVE scan from the SBOM alone
-grype sbom:application.cdx.json          # same, with a second scanner
-```
-
-What this deliberately does *not* include yet: **no SPDX** (CycloneDX JSON only), and **no signing or provenance** — [cosign](https://github.com/sigstore/cosign) signatures and [SLSA](https://slsa.dev/) attestation are noted as future follow-ups, not part of the first cut. An unsigned SBOM still answers "what's in here?"; it just doesn't yet prove "and here's cryptographic evidence it wasn't tampered with." That's the right order to build it in — generate first, attest later.
+The generalisable point for your own Solr-adjacent services: generating an SBOM is nearly free and answers "what's in here?"; *signing* it ([cosign](https://github.com/sigstore/cosign)) and attesting provenance ([SLSA](https://slsa.dev/)) is the separate, larger piece of work that answers "and prove it wasn't tampered with." Build them in that order.
 
 ## 6.10 Designing primitives for an LLM to use well
 
