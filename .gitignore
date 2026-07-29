@@ -9,5 +9,11 @@ chapters/*_files/
 *.lot
 .DS_Store
 
+# Editor/IDE state. code/.gitignore already covers these for the companion
+# project; this covers the book repo root.
+.vscode/
+.idea/
+*.iml
+
 /.quarto/
 **/*.quarto_ipynb
