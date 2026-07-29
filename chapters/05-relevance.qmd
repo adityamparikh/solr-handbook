@@ -133,6 +133,15 @@ public void logClick(SolrClient solr, String query, String docId,
 
 Run hourly. There are **two passes**: the rollup produces raw counts, and a second pass enriches each document with a `weight_d` that downstream consumers actually use.
 
+**First, a sixty-second Streaming Expressions primer** — because if you've never met one, the Pass 1 block below reads like Lisp that wandered into a search engine. [Streaming Expressions](https://solr.apache.org/guide/solr/latest/query-guide/streaming-expressions.html) are a functional pipeline language that runs *inside* Solr: you send an expression to a collection's `/stream` handler, and Solr executes it as a pipeline of **stream sources** (functions that emit tuples from an index — `search()`, `facet()`, `topic()`) wrapped in **stream decorators** (functions that transform another stream — `rollup()`, `select()`, `sort()`, `innerJoin()`, `update()`). Tuples flow through one at a time; the full result set is never materialised in memory. Read any expression **inside-out**:
+
+1. `search(collection, ..., qt="/export")` — the innermost *source* emits every matching document as a tuple stream. The `qt="/export"` matters: the `/export` handler streams complete sorted result sets straight off docValues (millions of rows, no pagination), where the default `/select` would stop at `rows`. The price: every field in `fl` and `sort` must have `docValues="true"`.
+2. `rollup(..., over="query_s,doc_id", count(*))` — a *decorator* that groups the incoming stream and emits one tuple per group with the aggregates. It assumes the input arrives **already sorted by the `over` fields** — that's why the inner `search` sorts by `query_s asc, doc_id asc`. Mismatch the sort and you get silently wrong counts, not an error.
+3. `select(...)` — projects and renames fields on each passing tuple, and can compute new ones (here, `concat()` builds the deterministic upsert `id`).
+4. `update(target, batchSize=...)` — the outermost decorator indexes every arriving tuple into another collection, batching as it goes.
+
+To execute, POST the expression to the source collection's stream endpoint — `curl --data-urlencode 'expr=update(...)' http://localhost:8983/solr/shows_signals/stream` — and Solr returns the tuples that flowed out of the outermost function (for an `update`, per-batch summaries). That is the entire mental model; the language has [dozens more sources and decorators](https://solr.apache.org/guide/solr/latest/query-guide/stream-source-reference.html) (joins, topics, even model scoring), but `update(select(rollup(search(...))))` is the aggregation idiom you'll reuse constantly.
+
 The `_signals_aggr` schema:
 
 ```xml
@@ -252,7 +261,9 @@ q.set("bq",
 
 The `{!boost b=weight_d}` wrapper multiplies each matching signal row's score by its `weight_d` before the join propagates the max — the standard parser's `^` only accepts a numeric boost factor, so `^{!func}…` would be a syntax error.
 
-This works but doesn't scale past a few million signal docs. Stick with the API-layer pattern for production.
+**The SolrCloud constraint that kills this pattern at scale.** `fromIndex` is not a general distributed join. The reference guide's requirement is strict: *"the collection specified in the `fromIndex` parameter must have a single shard and a replica on all Solr nodes where the collection you're joining to has a replica."* So `shows_signals_aggr` has to stay **single-shard** and be replicated onto **every** node that hosts a `shows` replica — which means it can never grow past what one shard can hold, and every node you add to `shows` also needs a full copy of the signals index. That is a workable arrangement for a few hundred thousand aggregated rows and a hard ceiling after that. (Solr's separate **Cross Collection Join** — a streaming-expression-backed `fq` that pulls join keys from a genuinely remote collection — lifts the co-location requirement, but it runs as a filter, not a scoring clause, so it doesn't give you the boost you want here.)
+
+Stick with the API-layer pattern for production; use `{!join}` when the signals index is small, static, and you'd rather not add a lookup to the request path.
 
 ### Index-time alternative
 
@@ -410,14 +421,14 @@ POST /solr/shows/query
 
 Each bucket returns `{count, r: {relatedness, foreground_popularity, background_popularity}}`. Sort descending on `r.relatedness` and you have, in one query, the genres most distinctive to Duffer-Brothers shows relative to the entire catalog (`sci-fi`, `horror`, `supernatural` will rank high; `period`, `romance` will not).
 
-A more useful production query — "what other shows are most associated with viewers who watch Netflix sci-fi shows?":
+A second, differently-shaped query — "which actors are most *characteristic* of Netflix sci-fi, as opposed to merely most frequent in it?":
 
 ```json
 {
   "query": "*:*",
   "limit": 0,
   "facet": {
-    "related_shows": {
+    "signature_cast": {
       "type":  "terms",
       "field": "cast_str",
       "limit": 20,
@@ -431,6 +442,10 @@ A more useful production query — "what other shows are most associated with vi
   }
 }
 ```
+
+The distinction between "most frequent" and "most characteristic" is the whole point, and it is why you sort on `r` rather than on `count`. A prolific actor who appears across every genre has a high `count` in the foreground set but a *low* relatedness, because they are just as common in the background. An actor who appears in three Netflix sci-fi shows and nothing else has a modest count and a high relatedness. Sorting by `count` gives you a popularity list; sorting by `r` gives you a signature.
+
+Note what this query is and isn't: the foreground and background are sets of **documents**, so it mines relationships that are present in your catalog's own fields. It says nothing about *viewers* — behavioural co-occurrence lives in the signals collection from §5.2, and you'd point `fg`/`bg` at *that* collection to mine it.
 
 From SolrJ via `JsonQueryRequest`:
 
@@ -491,7 +506,6 @@ Every commercial streaming service eventually needs the "when the user types `st
   <query text="star wars">
     <doc id="AND-001" />            <!-- Editorial: critically acclaimed -->
     <doc id="TM-001"  />
-    <doc id="LK-001"  />
   </query>
 </elevate>
 ```

@@ -62,7 +62,7 @@ The tabs you'll actually use:
 
   - **Documents** — Add a single document via JSON, XML, or CSV. Handy for one-off testing.
 
-> **Production tip — don't expose the admin UI to the public internet.** It's a development tool. In production, fence it off with a reverse proxy that requires authentication, or set `SOLR_OPTS="-Dsolr.ui.enabled=false"` if you genuinely don't need it. The production observability stack lives in §4.14, and cluster-wide authentication in §4.13.
+> **Production tip — don't expose the admin UI to the public internet.** It's a development tool. In production, fence it off with a reverse proxy that requires authentication, or turn it off entirely by uncommenting `SOLR_UI_ENABLED=false` in `solr.in.sh` (SOLR-14014; the companion `SOLR_UI_EXPERIMENTAL_ENABLED` switch controls only the new experimental UI that Solr 10 ships alongside the classic one). Note also that Solr binds to the **loopback interface** (`127.0.0.1`) by default — `SOLR_HOST_BIND` / `-Dsolr.host.bind` is what opens it up, and you should widen it no further than your application subnet. The production observability stack lives in §4.14, and cluster-wide authentication in §4.13.
 
 ## 2.1 What is a collection?
 
@@ -139,10 +139,23 @@ That command tells Solr: "create a collection called `shows`, use the `shows_con
 Equivalently from `bin/solr`:
 
 ```bash
-bin/solr create -c shows -d shows_config --shards 2 --replication-factor 2
+bin/solr create -c shows -n shows_config --shards 2 --replication-factor 2
 ```
 
-(Watch the short flags in Solr 10's CLI: `-s` is short for `--solr-url`, not shards.)
+Watch the flags — Solr 10's CLI renamed several of them and the short forms are not the ones muscle memory expects:
+
+| Flag | Long form | Meaning |
+|---|---|---|
+| `-c` | `--name` | Collection (or core) name |
+| `-n` | `--conf-name` | Name of an **existing** configset in ZooKeeper — this is what the command above uses |
+| `-d` | `--conf-dir` | A **local directory** to upload as a new configset (or one of the bundled configsets, e.g. `_default`) |
+| `-sh` | `--shards` | Number of shards |
+| `-rf` | `--replication-factor` | Replicas per shard |
+| `-s` | `--solr-url` | Base Solr URL — **not** shards |
+
+: The `bin/solr create` flags in Solr 10 and their short forms. `-n` reuses a configset already in ZooKeeper; `-d` uploads one from disk. {#tbl-02-create-flags}
+
+Mixing up `-n` and `-d` is the common trip-up: `-d shows_config` looks like "use the `shows_config` configset" but actually means "upload the local directory `shows_config`", and fails if no such directory exists under the Solr install.
 
 For a single-node dev cluster, `numShards=1` and `numReplicas=1` is fine. Production starts at 1 shard × 3 replicas for fault tolerance, and grows from there based on data size and traffic.
 
@@ -261,7 +274,11 @@ This decision is the hardest one to reverse cheaply. Changing field types or ana
   <!-- Title in English-analyzed form for relevance scoring, plus a string mirror
        for exact sort/facet (filled via copyField below). -->
   <field name="title"           type="text_en" indexed="true"  stored="true"/>
-  <field name="title_str"       type="string"  indexed="true"  stored="false" docValues="true"/>
+  <!-- copyField destination: stored=false AND useDocValuesAsStored=false, so atomic
+       updates (§2.8.1) don't reconstruct it twice — once from the copy, once from
+       docValues. StrField defaults useDocValuesAsStored to true; you must say no. -->
+  <field name="title_str"       type="string"  indexed="true"  stored="false" docValues="true"
+                                useDocValuesAsStored="false"/>
 
   <!-- Original title (non-English shows, e.g. "Squid Game" / "오징어 게임"). Stored
        as a string so we can show it verbatim and facet on language groupings. -->
@@ -280,7 +297,8 @@ This decision is the hardest one to reverse cheaply. Changing field types or ana
   <!-- Cast: analyzed for searchability ("show me everything with Pedro Pascal")
        AND a string mirror for facet/sort. -->
   <field name="cast"            type="text_en" indexed="true"  stored="true"  multiValued="true"/>
-  <field name="cast_str"        type="string"  indexed="true"  stored="false" docValues="true" multiValued="true"/>
+  <field name="cast_str"        type="string"  indexed="true"  stored="false" docValues="true" multiValued="true"
+                                useDocValuesAsStored="false"/>
 
   <!-- Numeric range/sort fields. -->
   <field name="release_year"    type="pint"    indexed="true"  stored="true"/>
@@ -366,7 +384,7 @@ Every example in the rest of this book — every query, every facet, every signa
 
 : The 30-show seed catalog every example in the rest of the book draws from, spanning 8 platforms, ~20 genres, mixed languages, and a mix of ongoing, ended, and cancelled status. {#tbl-02-seed-catalog}
 
-That's 30 shows across 8 platforms, ~20 distinct genres, English and non-English titles (`Shōgun`, `Squid Game`), running and ended status, and franchise relationships (`TM-001`, `LK-001`, `AND-001` all share the Star Wars / Marvel cinematic universe — useful for the `relatedness()` aggregation in §5.5).
+That's 30 shows across 8 platforms, ~20 distinct genres, English and non-English titles (`Shōgun`, `Squid Game`), running and ended status, and franchise relationships (`TM-001` and `AND-001` share the Star Wars universe as `franchise_id = "STAR-WARS"`, while `LK-001` is Marvel — `franchise_id = "MCU"`; both groupings are useful for the `relatedness()` aggregation in §5.5).
 
 Some examples below will refer to these specific IDs. The two pairs `TO-001` / `FLG-001` (US vs. UK *Office*) and the `MH-001` / `BB-001` near-collisions on prefix `b*` are intentional — they let us demonstrate disambiguation, prefix-query cost, and editorial overrides (§5.6) on realistic data.
 
@@ -465,15 +483,15 @@ For Solr 10, the Maven coordinates are:
 </dependency>
 ```
 
-The Solr 10 reference guide states verbatim: *"If you want to use Jetty-based HTTP clients (HttpJettySolrClient, ConcurrentUpdateJettySolrClient, LBJettySolrClient, or CloudJettySolrClient), you need to add the maven dependency solr-solrj-jetty."* Alternatively, *"you can use HttpJdkSolrClient from the base solr-solrj artifact, which uses Java's built-in HTTP client and has no additional dependencies."* The Jetty split is the result of SOLR-17161, which landed in Solr 10.0; further artifacts include `solr-solrj-zookeeper` (only needed if you really must speak ZooKeeper from the client) and `solr-solrj-streaming` (Streaming Expressions).
+The Solr 10 reference guide states verbatim: *"If you want to use Jetty-based HTTP clients (HttpJettySolrClient, ConcurrentUpdateJettySolrClient, LBJettySolrClient, or CloudJettySolrClient), you need to add the maven dependency solr-solrj-jetty."* Alternatively, *"you can use HttpJdkSolrClient from the base solr-solrj artifact, which uses Java's built-in HTTP client and has no additional dependencies."* The Jetty split is the result of SOLR-17161, which landed in Solr 10.0; further artifacts include `solr-solrj-zookeeper` (only needed if you really must speak ZooKeeper from the client) and `solr-solrj-streaming` (Streaming Expressions, §5.2). Both were transitive dependencies of `solr-solrj` in 9.x and are opt-in in 10 — part of the long-running SolrJ modularization effort tracked under SOLR-15730.
 
-> **Solr 9 difference — SolrJ packaging.** In Solr 9.x the Jetty clients lived inside `solr-solrj` itself, and the separate `solr-solrj-zookeeper`/`-streaming` modules came in transitively. Solr 10 moved the Jetty clients into `solr-solrj-jetty` (SOLR-17161) and made the other modules opt-in from a Maven-POM perspective (SOLR-15730). If you're upgrading a 9.x build script, expect to add `solr-solrj-jetty` (or switch to `HttpJdkSolrClient`) and possibly `solr-solrj-zookeeper`.
+> **Solr 9 difference — SolrJ packaging and package names.** In Solr 9.x the Jetty clients lived inside `solr-solrj` itself, and the separate `solr-solrj-zookeeper`/`-streaming` modules came in transitively. Solr 10 moved the Jetty clients into `solr-solrj-jetty` (SOLR-17161) and made the other modules opt-in from a Maven-POM perspective. Two renames come with it: `Http2SolrClient` → `HttpJettySolrClient` and `ConcurrentUpdateHttp2SolrClient` → `ConcurrentUpdateJettySolrClient`, both now in `org.apache.solr.client.solrj.jetty` rather than `…solrj.impl` (SOLR-18005). Separately, `SolrQuery` moved from `org.apache.solr.client.solrj` to `org.apache.solr.client.solrj.request`. If you're upgrading a 9.x build script, expect to add `solr-solrj-jetty` (or switch to `HttpJdkSolrClient`), possibly `solr-solrj-zookeeper`, and to fix those imports.
 
 > **Production tip — Solr 10 SolrJ runs on Java 17.** Per the Solr 10 upgrade notes, the minimum Java version for the Solr 10 *server* is Java 21, while the minimum for *SolrJ* 10 is Java 17. Java 17 client applications can still talk to a Solr 10 cluster.
 
 ### Connecting to SolrCloud
 
-In Solr 10, the recommended pattern is to connect via Solr node URLs, not directly to ZooKeeper. Solr 10.0 deprecated `CloudSolrClient.Builder`'s ZooKeeper-hosts constructor (SOLR-14070); the guidance is to give the client a list of Solr base URLs.
+In Solr 10, the recommended pattern is to connect via Solr node URLs, not directly to ZooKeeper. The ZooKeeper-hosts constructor on `CloudSolrClient.Builder` still compiles without a warning in 10.0.0 — its formal deprecation (SOLR-14070) is scheduled for **Solr 10.1** — but the guidance is already to give the client a list of Solr base URLs, and doing so also means you don't need the `solr-solrj-zookeeper` artifact on your classpath.
 
 ```java
 import org.apache.solr.client.solrj.SolrClient;
@@ -490,10 +508,11 @@ public class SolrFactory {
             "http://solr-2.solr-headless.solr.svc.cluster.local:8983/solr"
         );
         // Timeouts live on the internal HTTP client's builder, not on
-        // CloudSolrClient.Builder itself.
+        // CloudSolrClient.Builder itself. Use withHttpClientBuilder — the older
+        // withInternalClientBuilder is @Deprecated(since = "9.10") and just delegates.
         return new CloudSolrClient.Builder(solrUrls)
             .withDefaultCollection("shows")
-            .withInternalClientBuilder(new HttpJdkSolrClient.Builder()
+            .withHttpClientBuilder(new HttpJdkSolrClient.Builder()
                 .withConnectionTimeout(10, TimeUnit.SECONDS)
                 .withRequestTimeout(30, TimeUnit.SECONDS))
             .build();
@@ -503,7 +522,7 @@ public class SolrFactory {
 
 Hold the client as a long-lived singleton in your application — it's thread-safe and expensive to construct. Close it on shutdown.
 
-> **Solr 9 difference — ZooKeeper host constructor.** In Solr 9.x, `new CloudSolrClient.Builder(zkHosts, Optional.of(chroot))` was the common idiom: the client connected directly to ZooKeeper. That constructor was deprecated in Solr 10.0 (SOLR-14070, with removal unlikely before Solr 11) and the recommendation is to pass Solr base URLs as shown above (the client discovers the cluster via the Solr nodes themselves). If you absolutely must speak ZK from the client, add `solr-solrj-zookeeper` and use the ZK-host constructor — but the URL-list form is the future and is what works in production without the extra dependency.
+> **Solr 9 difference — ZooKeeper host constructor.** In Solr 9.x, `new CloudSolrClient.Builder(zkHosts, Optional.of(chroot))` was the common idiom: the client connected directly to ZooKeeper. It still works in Solr 10.0 and is not yet annotated `@Deprecated` — that lands in 10.1 (SOLR-14070), with removal unlikely before Solr 11 — but the recommendation is to pass Solr base URLs as shown above (the client discovers the cluster via the Solr nodes themselves). If you absolutely must speak ZK from the client, add `solr-solrj-zookeeper` and use the ZK-host constructor — but the URL-list form is the future and is what works in production without the extra dependency.
 >
 > Also in Solr 10, the `Major Changes` page notes: *"CloudHttp2SolrClient.Builder has moved to CloudSolrClient; users should generally have no need to refer to CloudHttp2SolrClient or any class/member with 'http2' in it. The builder will check if Jetty HttpClient is available and use that, otherwise fallback on a JDK based HttpClient."* For new code in Solr 10, prefer `CloudSolrClient.Builder` directly. The `CloudHttp2SolrClient` symbol still exists for source compatibility but is effectively an alias.
 
@@ -737,7 +756,9 @@ These are the only six. Anything else — rename a field, concatenate strings, d
 
 #### Schema requirements
 
-From the Solr 10 reference guide: every "real" field your application populates must be `stored="true"` OR `docValues="true"`. Solr reconstructs the document from one of those. The exception is `copyField` destinations, which must **not** be stored and must not behave as if stored — `stored="false"`, plus `useDocValuesAsStored="false"` if the destination keeps `docValues` — otherwise on each atomic update Solr would double-write — once from the source-field copy and once from the existing stored destination value — producing duplicate or stale tokens.
+The Solr 10 reference guide states the rule exactly: *"all fields in your schema must be configured as stored (`stored="true"`) or docValues (`docValues="true"`) except for fields which are `<copyField/>` destinations, which must be configured as `stored="false"` and either `docValues="false"` or `useDocValuesAsStored="false"`."*
+
+The reason for the `copyField` carve-out: on every atomic update Solr reconstructs the whole document from what it can read back, then reindexes it — which re-runs `copyField`. If the destination is *also* readable (stored, or docValues-backed with `useDocValuesAsStored="true"`), the reconstructed document already contains the destination's old values, and the copy adds them again. The symptom is a multi-valued field that grows by one duplicate on every update, or a single-valued one that rejects the update outright. This is why `title_str` and `cast_str` in §2.3 carry `useDocValuesAsStored="false"` — `StrField` with `docValues="true"` defaults it to `true`, which is exactly the shape that breaks.
 
 If any required field violates these rules, the entire atomic update fails. There is no partial recovery.
 
@@ -825,7 +846,7 @@ Solr decides at request time, per field. **All** of the following must hold:
 
 If *any* of those is violated, Solr **silently falls back** to a regular atomic update — same response, very different cost. That silent fallback is the trap.
 
-> **Production tip — fail fast with `update.partial.requireInPlace=true`.** Since Solr 9 you can set this request parameter; if the update can't be done in-place the request fails instead of silently falling back. Use this on hot counter paths in your CI tests — the day someone "helpfully" adds `stored="true"` to your counter field, the build breaks instead of production performance.
+> **Production tip — fail fast with `update.partial.requireInPlace=true`.** This request parameter (SOLR-15150, available since Solr 8.9/9.0) makes an atomic update that *can't* be done in-place fail outright instead of silently falling back. Use it on hot counter paths in your CI tests — the day someone "helpfully" adds `stored="true"` to your counter field, the build breaks instead of production performance.
 
 #### Schema pattern for counters
 
@@ -849,7 +870,7 @@ public void bumpViewCount(SolrClient client, String docId) throws Exception {
 
     UpdateRequest req = new UpdateRequest();
     req.add(doc);
-    req.setParam("update.partial.requireInPlace", "true"); // fail fast (Solr 9+)
+    req.setParam("update.partial.requireInPlace", "true"); // fail fast (SOLR-15150, 8.9+)
     req.process(client, "shows");
 }
 ```
@@ -949,6 +970,34 @@ req.process(client, "shows");
 ```
 
 Caveats: an *atomic* update on a child document reindexes the entire tree from the root — expect that overhead; an *in-place* update (an eligible numeric docValues-only field, per §2.8.2) is exactly how you avoid it. And delete-by-id only works on root documents — to delete a child, use delete-by-query or an atomic remove on the parent's children pseudo-field.
+
+### 2.8.5 Querying nested documents: `{!parent}` and `{!child}` (briefly)
+
+If you do adopt the show-with-nested-episodes granularity from @tbl-02-doc-granularity, you also need the query side: the **block-join query parsers**. Nested documents are stored as a contiguous *block* in the index (children first, parent last — that's what `_root_` pins together), and the block-join parsers exploit that layout to cross levels in a single query, no application-side join.
+
+Two parsers, mirror images of each other:
+
+```text
+# Parents from children: shows with at least one episode rated ≥ 9
+q={!parent which="doc_type_s:show"}episode_rating_f:[9 TO *]
+
+# Children from parents: the episodes of every ongoing show
+q={!child of="doc_type_s:show"}status:ongoing
+```
+
+- `{!parent which=<allParents>}<childQuery>` returns **parent** documents whose children match the child query.
+- `{!child of=<allParents>}<parentQuery>` returns the **child** documents of parents matching the parent query.
+
+**The gotcha that corrupts results — `which`/`of` is a *filter*, not your search.** Both parameters must be a query that matches **every parent document in the index** (and no children) — a structural marker like `doc_type_s:show`, *not* the thing you're searching for. Putting the user's query in `which` is the classic block-join mistake; because the parser uses it to build a bitmask of parent positions, getting it wrong silently mismatches parents to other documents' children or throws cryptic `child query must only match non-parent docs` errors. Keep a dedicated discriminator field (`doc_type_s`) on every parent for exactly this purpose.
+
+To return matched parents *with* their children in one response, add the `[child]` document transformer to `fl`:
+
+```text
+q={!parent which="doc_type_s:show"}episode_rating_f:[9 TO *]
+&fl=id,title,[child limit=5 fl=id,episode_title_s]
+```
+
+That's the whole surface you need for the catalog use case. The deeper end — `childFilter` on the transformer, multi-level nesting addressed via `_nest_path_`, combining block-join with faceting (`uniqueBlock()`) — lives in the reference guide's [searching-nested-documents](https://solr.apache.org/guide/solr/latest/query-guide/searching-nested-documents.html) page. And remember the §2.2 warning before reaching for any of it: nested documents buy single-query convenience at the price of block-integrity maintenance — every tree update rewrites the whole block (§2.8.4), and a flat schema with an application-side join is often the better production trade.
 
 ## 2.9 Reindexing: when, why, and how
 
@@ -1264,7 +1313,7 @@ A manual `optimize` (or `commit(optimize=true)`) forces all segments into one (o
 - The text analysis chain (`Tokenizer + Filters`) is the most important relevance lever you have; keep index/query symmetric except for query-time synonym expansion.
 - Use `CloudSolrClient` for connections; batch with `add(Collection)` or use `ConcurrentUpdateJettySolrClient` for fire-and-forget throughput.
 - **Test against a real Solr.** Use `SolrContainer` from Testcontainers with the official `solr:10.0.0` image and a base-URL HTTP client. One `static` container per test class; clean the index in `@BeforeEach` rather than restarting.
-- Partial updates come in three flavors: **full replace** (default), **atomic** (server-side modifier maps — still a full reindex underneath), and **in-place** (genuine docValues-only update for single-valued numeric fields). Use `update.partial.requireInPlace=true` (Solr 9+) to fail fast when an in-place update would silently fall back to atomic.
+- Partial updates come in three flavors: **full replace** (default), **atomic** (server-side modifier maps — still a full reindex underneath), and **in-place** (genuine docValues-only update for single-valued numeric fields). Use `update.partial.requireInPlace=true` (SOLR-15150, Solr 8.9+) to fail fast when an in-place update would silently fall back to atomic.
 - Optimistic concurrency via `_version_` (`-1` = must not exist, `1` = must exist, `N` = exact match) composes freely with all three update flavors.
 - Reindex when index-time analysis, field types, codec, `luceneMatchVersion`, or `copyField` declarations change. Skip reindexing for query-time-only changes (synonyms!), new untouched fields, and `solrconfig.xml` knobs that don't affect storage.
 - Production reindexing is **blue/green with collection aliases**: build into a new collection, validate, atomically swap the alias, keep the old around for rollback. Read from your system of record when possible; `REINDEXCOLLECTION` is convenient but lossy for non-stored fields.

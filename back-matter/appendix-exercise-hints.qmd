@@ -1,0 +1,44 @@
+# Appendix B — Exercise hints {.unnumbered}
+
+Hints, not solutions. Each one names the section to re-read and the insight the exercise is really testing; if a hint alone unlocks the answer, you already knew more than you thought. Work the exercise first — the hints assume you're stuck, not starting.
+
+## Chapter 1
+
+1. **Hand-build a posting list.** Lowercase, split on whitespace and punctuation, then sort the unique terms — that sorted list *is* the term dictionary. `df=1` terms are the ones appearing in exactly one title (usually the proper nouns). The most diagnostic query terms are precisely those: rare terms have high IDF, so one term can pin one document.
+2. **Predict the cost.** Rank by *which structure* each query touches (§1.4): a single term is one dictionary lookup plus one postings list; a phrase adds a positions intersection; a numeric range walks the BKD point tree; a trailing wildcard scans a *bounded range* of the term dictionary; a fuzzy query walks a Levenshtein automaton across it; a **leading** wildcard visits *every term* in the dictionary. Two of the six differ by an order of magnitude despite looking nearly identical.
+3. **Pick the right tool.** For the first set of criteria, be honest: §1.7 says Postgres FTS handles 2M rows with stemming and booleans inside 200 ms. The changed requirement is the tell — 50 simultaneous facet aggregations need a column store (docValues, §1.4), which is exactly what an RDBMS's row-oriented storage lacks.
+
+## Chapter 2
+
+1. **Design a schema.** The traps are: sorting on a `multiValued` field (can't), faceting without `docValues` (uses slow, heap-hungry fallbacks or fails, depending on type), and the after-the-fact `docValues=true` — which is an index-format change, so §2.9.1 says full reindex, not an edit.
+2. **Atomic vs. in-place.** Walk §2.8.2's criteria in order: single-valued, numeric/date, `docValues=true`, `indexed=false`, `stored=false`, and not a `copyField` source or target. Most "obviously in-place" fields fail on `indexed` or `stored`. The `requireInPlace=true` flag turns your prediction into a falsifiable experiment — a 400 response means you predicted wrong.
+3. **Zero-downtime reindex.** You never mutate the live collection. Create `shows_v2` with the corrected schema, populate from the *system of record* (not `REINDEXCOLLECTION` — `description` was `string`-typed, but check what else isn't stored), verify doc counts plus a fixed probe-query set, then `CREATEALIAS shows → shows_v2`. Rollback is the same `CREATEALIAS` pointed back — which is why you keep `shows_v1` around.
+4. **Testcontainers.** One `static SolrContainer` per class (§2.7); pass the configset directory at container build time. The 15-second budget forces the right habits: reuse the container across test methods and clean with `deleteByQuery("*:*")` in `@BeforeEach`, never restart.
+
+## Chapter 3
+
+1. **eDisMax in three steps.** In the `debug=true` output, look for the extra `DisjunctionMaxQuery` clause covering the whole phrase against `title` — that's `pf` at work; `ps=2` shows up as slop. In the `[explain]` tree, the `boost` function multiplies the whole score while `bq` adds a clause — that structural difference (multiplicative vs. additive) is the point of the exercise.
+2. **Collapse vs. grouping.** §3.9: collapse is a post-filter and needs all group members on the same shard — which the compositeId prefix (`SHOWID!episodeid`) guarantees. Legacy grouping "works" cross-shard but pays a coordination cost per group per shard. One of the two answers is also the one the book tells you to stop using.
+3. **Hand-compute RRF.** Same arithmetic as the §3.6 worked table: each list contributes `1/(60+rank)`, absentees contribute 0. Two shows will tie *exactly* — ask yourself why a rank-4 BM25-only document and a rank-4 KNN-only document must have identical fused scores. At `k=10`, check whether any both-lists document falls below a single-list one before trusting your intuition about "k changes everything."
+4. **Spot the slow query.** `*ing` has no prefix, so the term dictionary's sorted order (and its FST index) is useless — every term gets visited. Compare with `stranger`: one lookup. The classic schema fix makes the suffix into a prefix: index the field a second time with the terms reversed, and rewrite trailing-anchored wildcards against it.
+
+## Chapter 4
+
+1. **Size a cluster.** Work backwards: 80M × 3 KB ≈ 240 GB of raw documents — decide a target per-shard index size first (§4.4 gives the range), and that fixes the shard count. Then replicas-per-shard comes from measured per-replica QPS against your p95 target, not from vibes. Heap stays below the compressed-oops line (§4.10); disk is a multiple of index size because merges need headroom.
+2. **Choose replicas.** Ask two questions per workload: does indexing latency matter, and do queries deserve isolation from indexing cost? (a) is write-dominated with rare reads; (b)'s hourly bulk reindex is exactly what PULL replicas isolate query traffic from; (c) is small enough that operational simplicity beats cleverness.
+3. **Trace a failover.** The trigger is an *ephemeral* znode vanishing when the leader's ZooKeeper session dies — so your "how long" answer starts with the session timeout, not with Solr code. Then: leader-election queue advances, the candidate syncs from its transaction log, publishes the new leader in `state.json`. Writes block for the whole window; reads don't.
+4. **Kubernetes spec.** The operator CR gives you most of it; the parts worth sweating are `podAntiAffinity` (per-shard, not per-cluster) and zone spread. Validate by listing which pods *could* be co-scheduled — if two replicas of `shard1` can land on one node, your rule is on the wrong label.
+
+## Chapter 5
+
+1. **Judgment list.** DCG@5 sums `(2^grade − 1) / log2(position + 1)`; the ideal ordering is your grades sorted descending. If your schema change "didn't move" the number, check whether any of your 20 queries actually exercise the changed field before concluding the change is worthless.
+2. **Aggregate signals.** Start from the §5.2 two-pass expression verbatim and change one thing: the timestamp window. The `weight_d ∈ [0,1]` and "heaviest doc gets 1.0" properties come from Pass 2's `log1p(count)/log1p(max)` — verify the max is computed *per query*, not globally, or every query but one fails the check.
+3. **Cap the boost.** The probe query gives you the BM25 max-score; clamp with `Math.min`. The danger is the feedback loop: a boosted document gets more clicks *because it ranks higher*, which raises its boost, which raises its clicks — signals boosting without a cap is a rich-get-richer machine that eventually pins yesterday's popular content over today's relevant content.
+4. **Pick LTR features.** Good text features re-use what you already tuned in §3.2 (a phrase match on `title`, an eDisMax match on `description`); good field features are the ones users actually behave on (`rating`, recency via `release_year`). The `efi.user_query` feature should measure something *about the relationship* between the query and the document, not the document alone.
+
+## Chapter 7
+
+1. **Argue both sides.** The strongest Solr argument is not performance — it's control: pure Apache 2.0, on-prem, explicit schema, first-class faceting. The strongest OpenSearch argument is consolidation: one stack for search plus the observability you already need. For the 90-day question, the honest tiebreaker is which stack your team can already operate.
+2. **Translate a query.** `qf` → `multi_match` fields with boosts, `mm` → `minimum_should_match`, `pf` → an added `match_phrase` `should` clause, `tie` → `tie_breaker`. The thing that refuses to translate cleanly is Solr's multiplicative `boost` parameter — Elasticsearch needs a `function_score` wrapper to do the same job, which restructures the whole query.
+3. **Audit the licensing.** Solr and OpenSearch: Apache 2.0, yes, ship it. Elasticsearch requires choosing *which* license you're consuming it under — and each of AGPLv3 (copyleft obligations), SSPL, and ELv2 (service restrictions) creates a different problem for a closed-source commercial product. Cite §7.2's timeline; the answer changed twice in four years.
+4. **Pick the right MCP server.** They run OpenSearch and know OpenSearch — §7.9's pattern-similarity argument says the OpenSearch MCP server is the low-risk move. What they gain: no new engine to operate. What they give up: the tight JVM/Spring alignment (and the Solr-specific tool surface) that a greenfield Solr + Apache Solr MCP Server stack would give a Java shop.

@@ -31,7 +31,8 @@ The index is alphabetical by topic; bold entries point to the section where a co
 ### C
 
 - cache thrash from over-committing, §2.10
-- caches (`filterCache`, `queryResultCache`, `documentCache`), §4.14
+- caches (`filterCache`, `queryResultCache`, `documentCache`), **§3.1**; autowarming, §3.1; monitoring, §4.14
+- `cache=false` local param, **§3.1**
 - cardinality and faceting, §3.3
 - circuit breakers, §4.14
 - citation policy, *Preface — Conventions*
@@ -47,22 +48,24 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - compositeId routing, **§4.5**; prefix routing (`!`), §4.5, §3.9
 - ConcurrentUpdateJettySolrClient, §2.6; Solr 9 → 10 rename, §2.6
 - configset, **§4.8**
-- copyField, **§2.5**; destinations must be `stored=false`, §2.8.1
+- copyField, **§2.5**; destinations must be `stored=false` and `useDocValuesAsStored=false`, §2.8.1
 - core (Solr), §2.1
 - cosine similarity, **§3.6** (illustrative example)
 - cuVS GPU codec, §3.6, §7.6 (experimental)
-- cursorMark, **§2.9.4**
+- cursorMark, **§2.9.4**; vs. `start`/`rows` deep paging, §3.1
 
 ### D
 
 - debugging queries (`debug=true`, `[explain]`), **§3.10**
+- deep paging, §3.1 — see also *cursorMark*
 - deletes (soft, live-docs bitset), §1.3
-- DenseVectorField, **§3.6**
+- DenseVectorField, **§3.6**; quantized variants, §3.6; `cagra_hnsw` (GPU), §3.6
+- `{!vectorSimilarity}` parser, §3.6
 - diagram conventions, *Preface — Diagrams*
 - DisMax, §3.2
 - distributed query flow, **§4.9**
 - doc values, **§1.3**; required for sort/facet, §2.3; required for in-place updates, §2.8.2
-- Docker image (`apache/solr`), §2.7
+- Docker image (Docker Official Image `solr`), §2.7
 - document routing, **§4.5**
 - dynamicField, **§2.5**
 
@@ -82,7 +85,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - feature store (LTR), §5.4
 - field properties (`indexed`, `stored`, `docValues`, …), **§2.3**
 - field types (`StrField`, `TextField`, point types), §2.3, §1.4.1
-- filter query (`fq`), §3.1
+- filter query (`fq`), **§3.1**; caching, §3.1; post-filters and `cost`, §3.1
 - five data structures in a Lucene segment, **§1.3**
 - function queries, **§3.5**; doc-values backed, §1.4.8
 
@@ -177,7 +180,8 @@ The index is alphabetical by topic; bold entries point to the section where a co
 ### P
 
 - partial updates — see *atomic updates*, *in-place updates*
-- placement plugins, **§4.11**
+- placement plugins, **§4.11**; `SimplePlacementFactory` is the default, §4.11
+- post-filter (`cost>=100`), **§3.1**; Collapse as a post-filter, §3.9
 - positions (in postings), §1.3, §1.4.3
 - Postgres FTS comparison, **§1.7**
 - postings, **§1.3**; intersection (AND), §1.4.2
@@ -209,6 +213,9 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 - schema design, **§2.3**
 - security: Basic authentication, **§4.13**; JWT/OIDC (`jwt-auth` module), §4.13; in MCP server, §6.7
+- security advisories and CVEs, §4.13, *References*
+- `blockUnknown` (set it explicitly), **§4.13**, Appendix A
+- `shards.tolerant` / `partialResults`, §3.1
 - `security.json`, **§4.13**
 - seed dataset (the 30-show table), **§2.3**
 - segment, Lucene, **§1.3**, §2.11
@@ -241,6 +248,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - term dictionary, **§1.3**; FST term index, §1.3
 - term frequency (TF), §1.5, §3.5
 - Testcontainers, **§2.7**
+- `timeAllowed`, §3.1, §3.11.2
 - TF saturation (`k1`), §1.5
 - text analyzer chain, **§2.4**
 - time-routed aliases, *not covered*
