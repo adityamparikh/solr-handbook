@@ -1,16 +1,53 @@
-# Why Solr?
+# What Is Solr, and Why?
 
-> **What this chapter covers and why it matters.** Before you adopt any search engine, you should be able to defend, in one paragraph, why a B-tree index over `VARCHAR` columns is *not* the right tool for the job. This chapter builds that intuition with a concrete TV-shows catalog example, walks through the inverted-index data structure as it actually lives on disk in Lucene, and shows step-by-step how each kind of query (term, phrase, prefix, wildcard, fuzzy, range, boolean) is executed against those files. It ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
+> **What this chapter covers and why it matters.** Before you adopt any search engine, you should be able to say what it actually is and defend, in one paragraph, why a B-tree index over `VARCHAR` columns is *not* the right tool for the job. This chapter starts by placing Solr precisely: a search *server* built on the Apache Lucene *library*. It then builds the case for an inverted index with a concrete TV-shows catalog example, walks through that data structure as it actually lives on disk in Lucene, and drops down to plain Lucene Java code so you can see the moving parts Solr manages for you. It closes with step-by-step execution of each kind of query (term, phrase, prefix, wildcard, fuzzy, range, boolean) and a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
 >
-> **Prerequisites:** Working knowledge of SQL and B-tree indexes. No prior Solr experience needed.
+> **Prerequisites:** Working knowledge of Java, SQL, and B-tree indexes. No prior Solr or Lucene experience needed.
 >
-> **You will learn:** What an inverted index is, the five data structures inside a Lucene segment, how each Solr query type maps to those structures, the cost model that makes wildcards expensive and term queries cheap, and when Solr is and isn't the right tool.
+> **You will learn:** What Solr is and how it relates to Lucene, what an inverted index is, the five data structures inside a Lucene segment, Lucene's core Java API (`Directory`, `Analyzer`, `IndexWriter`, `IndexSearcher`, `Query`) and what Solr layers on top of it, how each Solr query type maps to those structures, the cost model that makes wildcards expensive and term queries cheap, and when Solr is and isn't the right tool.
 >
-> **What you should not skip:** §1.3 (the five data structures). Everything in later chapters refers back to it.
+> **What you should not skip:** §1.4 (the five data structures). Everything in later chapters refers back to it. If you have only ever used Solr over HTTP, §1.5–§1.6 are the fastest way to understand what a schema line or a commit *does* underneath.
+>
+> **Companion code:** the plain-Lucene examples in §1.5 are runnable and unit-tested in [`code/src/main/java/solrbook/lucene/`](https://github.com/adityamparikh/solr-handbook/tree/main/code).
 
 ![The Apache Solr™ logo — a trademark of the Apache Software Foundation, reproduced here descriptively from the project's official logo set (apache.org/logos) to identify the software this book covers. Its use does not imply endorsement by the ASF.](figures/01-why-solr/apache-solr-logo.png){#fig-01-solr-logo width=50% fig-align="center"}
 
-## 1.1 The naive approach: SQL `LIKE`
+## 1.1 What is Solr?
+
+**Apache Solr is an open-source search server.** You run it as a standalone Java process (or a cluster of them), send it documents over HTTP, and ask it questions over HTTP. It returns ranked results, facet counts, highlights, suggestions, and nearest-neighbour vector matches, typically in tens of milliseconds over tens or hundreds of millions of documents.
+
+Underneath, every Solr core is an **Apache Lucene index**. Lucene is a Java *library* — a JAR you embed in your own process — that implements the inverted index, text analysis, scoring, and vector search. Lucene has no network API, no configuration files, no notion of a cluster, and no opinion about how your data is shaped. Solr is everything you need to turn that library into a service you can operate:
+
+```{mermaid}
+%%| label: fig-01-solr-layers
+%%| fig-cap: "Where Solr ends and Lucene begins. Your application talks HTTP (usually through SolrJ); Solr turns requests into Lucene operations; Lucene owns the bytes on disk."
+flowchart TB
+    APP["Your application<br/>(Spring Boot service, batch job, MCP server)"]
+    APP -- "HTTP / JSON<br/>(SolrJ, curl, any client)" --> SOLR
+    subgraph SOLR["Solr server (Jetty, Java 21)"]
+        direction TB
+        API["Request handlers<br/>/select, /update, Schema API, Collections API"]
+        CFG["Schema + solrconfig.xml<br/>field types, analyzers, caches, commits"]
+        FEAT["Query parsers, faceting, highlighting,<br/>spellcheck, LTR, update log, security"]
+        CLOUD["SolrCloud<br/>shards, replicas, ZooKeeper, routing"]
+    end
+    SOLR -- "Java calls<br/>IndexWriter / IndexSearcher" --> LUC["Lucene 10.3 library<br/>analysis, inverted index, BM25,<br/>doc values, HNSW vectors"]
+    LUC -- "segment files" --> DISK[("Directory<br/>(local disk)")]
+```
+
+A few facts worth having straight before the rest of the book:
+
+- **Lineage.** Lucene was written by Doug Cutting in 1999 and joined the Apache Software Foundation in 2001. Solr was created by Yonik Seeley at CNET Networks in 2004 and donated to the ASF in 2006. The two projects merged their development in 2010 and split again into separate top-level projects in 2021; Solr still releases against a specific Lucene version (Solr 10.0 ships Lucene 10.3). Elasticsearch and OpenSearch are built on the same library — Chapter 7 tells that story.
+- **License.** Apache License 2.0, with no source-available or dual-licensed editions. What you download is what everyone runs.
+- **Deployment shapes.** **SolrCloud** (the Solr 10 default) shards and replicates collections across nodes coordinated by ZooKeeper (Chapter 4). **User-managed** mode (`--user-managed`, formerly "standalone") runs independent cores with no ZooKeeper.
+- **Interface.** Everything is HTTP: JSON or XML for updates, query parameters or a JSON request body for search, JSON for admin APIs. Java applications use the **SolrJ** client (Chapter 2); there is also a browser-based Admin UI.
+- **Configuration over code.** You describe fields and analysis in a schema, and caches, commits, and request handlers in `solrconfig.xml`. Most production Solr deployments contain no custom Java at all — but when you need it, Solr's plugin points (query parsers, token filters, similarities, update processors) are thin wrappers over Lucene classes.
+
+**What Solr is not.** It is not a system of record: there are no multi-document transactions, no joins in the relational sense, and the only way to change a field's indexing is to reindex (§2.9). Keep your source of truth in a database or event log and treat Solr as a derived, rebuildable read model. It is also not a library — if you want search *inside* your own JVM with no extra process, that is Lucene's job (§1.6 says when that is the right call).
+
+The rest of this chapter works bottom-up: why search needs a different data structure (§1.2–§1.3), what Lucene actually stores (§1.4), how you drive Lucene from Java (§1.5), what Solr adds on top (§1.6), and what each query costs (§1.7).
+
+## 1.2 The naive approach: SQL `LIKE`
 
 Imagine a `shows` table with 50 million rows — every TV show ever made, every region, every platform. A user types `stranger things` into your search bar. The naive query is:
 
@@ -31,7 +68,7 @@ This works for a demo and fails in production for four independent reasons:
 
 Production search engines solve all four problems with a different data structure: the **inverted index**.
 
-## 1.2 The inverted index, conceptually
+## 1.3 The inverted index, conceptually
 
 A B-tree maps **row → column value**. An inverted index maps **term → list of rows containing that term**. The asymmetry is the entire point.
 
@@ -71,7 +108,7 @@ world      1    3→(1,[3])
 
 Looking up `stranger` is an `O(log V)` operation in the term dictionary (where V is vocabulary size — typically much smaller than the document count); the posting list itself is a sorted, delta-encoded, block-compressed stream of doc IDs. The conjunction `stranger AND thing` is a **leap-frog intersection** of two sorted streams, skipping with auxiliary skip-lists. The whole operation is fast even at billions of documents. Notice also that Porter stemming maps `strange` to `strang` but `strangers` only to `stranger` (the plural `-s` is stripped; `-er` never is) — three related surface forms, two distinct roots that never collapse together. This is a real quirk of the English Porter stemmer and a recurring source of "why didn't my synonym work?" confusion (covered in §2.4).
 
-## 1.3 What's actually in a Lucene index
+## 1.4 What's actually in a Lucene index
 
 The conceptual picture above is what every "inverted index in 5 minutes" blog post draws. In practice, a Solr index is more than just term → docs. To answer real queries — with ranking, sorting, faceting, phrase matching, and returning fields to the client — Lucene maintains several different data structures side by side. You don't need to know their on-disk layout to be effective with Solr, but you do need to know **what's there and why**.
 
@@ -107,7 +144,7 @@ flowchart LR
 
 : The five data structures inside a Lucene segment, what each one is for, and an example access pattern. {#tbl-01-lucene-structures}
 
-The term dictionary is **sorted**, which is why prefix queries (`appl*`) are cheap and leading-wildcards (`*pple`) are expensive — covered in §1.4. The posting list for a term is **sorted by doc-id and skip-list-indexed**, which is why `AND`-ing two posting lists ("leap-frog intersection") is fast. Doc values are a **column-store** — one column per field, laid out doc-id by doc-id — which is why faceting and sorting are cheap *when you have `docValues=true`* and brutal when you don't. Stored fields are **compressed in chunks**, which is why returning huge `rows=1000` pages is expensive even when the search itself was fast.
+The term dictionary is **sorted**, which is why prefix queries (`appl*`) are cheap and leading-wildcards (`*pple`) are expensive — covered in §1.7. The posting list for a term is **sorted by doc-id and skip-list-indexed**, which is why `AND`-ing two posting lists ("leap-frog intersection") is fast. Doc values are a **column-store** — one column per field, laid out doc-id by doc-id — which is why faceting and sorting are cheap *when you have `docValues=true`* and brutal when you don't. Stored fields are **compressed in chunks**, which is why returning huge `rows=1000` pages is expensive even when the search itself was fast.
 
 You will see references to specific files (`.tim`, `.doc`, `.dvd`, `.fdt`, `.nvd`, `.vec` etc.) in Solr logs, segment listings, and JIRA tickets. They map directly to the structures above. You almost never need to think about them at that level.
 
@@ -126,11 +163,175 @@ If you want the actual file format, encoding tricks (FST term index, PFOR-delta 
 
 For the rest of this book, knowing that these five structures exist — and what each is for — is enough.
 
-## 1.4 How each query type actually executes
+## 1.5 Lucene from a Java developer's perspective
+
+You will rarely write Lucene code when you run Solr. But Solr's schema attributes, commit settings, and query parsers are a thin, declarative skin over a small number of Lucene classes, and seeing those classes once makes every later chapter easier to reason about. This section is deliberately "just enough": the key components, one runnable example, and the decisions the example forces you to make.
+
+### The key components
+
+| Lucene component | Main classes | What it does | Where Solr configures it |
+|---|---|---|---|
+| **Directory** | `FSDirectory` / `MMapDirectory`, `ByteBuffersDirectory` | Abstracts where segment files live (disk, memory-mapped, heap). | `<directoryFactory>` in `solrconfig.xml` |
+| **Document and fields** | `Document`, `TextField`, `StringField`, `IntPoint`, `SortedSetDocValuesField`, `StoredField`, `KnnFloatVectorField` | A document is a flat bag of fields. Each field class feeds *one* of the §1.4 structures. | Schema `<field>` + `indexed` / `stored` / `docValues` flags |
+| **Analyzer** | `Analyzer`, `StandardAnalyzer`, `EnglishAnalyzer`, `CustomAnalyzer`, `PerFieldAnalyzerWrapper` | A `Tokenizer` plus a chain of `TokenFilter`s that turns text into terms, at index *and* query time. | `<fieldType><analyzer>` chains (§2.4) |
+| **IndexWriter** | `IndexWriter`, `IndexWriterConfig`, `MergePolicy` | The single writer per index: adds, updates, and deletes documents, flushes segments, merges them, commits. | `/update` handlers, `<indexConfig>`, commits (§2.10–§2.11) |
+| **Reader and searcher** | `DirectoryReader`, `IndexSearcher`, `SearcherManager` | A point-in-time, read-only view of the segments, and the object that runs queries against it. | `SolrIndexSearcher`, "opening a new searcher", cache warming (§3.1) |
+| **Query** | `TermQuery`, `BooleanQuery`, `PhraseQuery`, `IntPoint.newRangeQuery`, `KnnFloatVectorQuery`, classic `QueryParser` | An object tree describing what to match. Parsers build these trees from strings. | Query parsers: `lucene`, `edismax`, `knn`, … (§3.2) |
+| **Results** | `TopDocs`, `ScoreDoc`, `Sort`, `SortField` | Top-N internal doc ids with scores, optionally sorted by doc values. | `rows`, `start`, `sort`, `fl` |
+| **Similarity** | `BM25Similarity` (default) | Scores each matching document (§1.8). | `<similarity>` in the schema (§3.5) |
+
+: Lucene's core Java components, what each does, and the Solr configuration that drives it. {#tbl-01-lucene-components}
+
+### Indexing and searching the shows catalog in plain Lucene
+
+Three artifacts are enough: `lucene-core` (index, search, `StandardAnalyzer`), `lucene-analysis-common` (language analyzers such as `EnglishAnalyzer`), and `lucene-queryparser` (the classic query syntax). Use the Lucene version your Solr release ships so the behaviour matches — 10.3.2 for Solr 10.0.0:
+
+```kotlin
+// build.gradle.kts
+val luceneVersion = "10.3.2"
+dependencies {
+    implementation("org.apache.lucene:lucene-core:$luceneVersion")
+    implementation("org.apache.lucene:lucene-analysis-common:$luceneVersion")
+    implementation("org.apache.lucene:lucene-queryparser:$luceneVersion")
+}
+```
+
+```xml
+<!-- pom.xml: same three artifacts -->
+<dependency>
+  <groupId>org.apache.lucene</groupId>
+  <artifactId>lucene-core</artifactId>
+  <version>10.3.2</version>
+</dependency>
+<!-- ...plus lucene-analysis-common and lucene-queryparser -->
+```
+
+**Step 1 — decide the analysis, open a writer, and share searchers.** The analyzer must be the same at index and query time, or query terms will never match indexed terms. `SearcherManager` opened from the writer gives near-real-time visibility: you can see new documents without a commit.
+
+```java
+Directory directory = FSDirectory.open(Path.of("/var/data/shows-index"));
+Analyzer analyzer = new PerFieldAnalyzerWrapper(
+    new StandardAnalyzer(),
+    Map.of("title", new EnglishAnalyzer(), "description", new EnglishAnalyzer()));
+
+IndexWriter writer = new IndexWriter(directory, new IndexWriterConfig(analyzer));
+SearcherManager searcherManager = new SearcherManager(writer, null);
+```
+
+**Step 2 — map each logical field onto Lucene fields.** This is the step Solr's schema does for you. A Lucene field class does *one* job, so a field you want to filter on, facet on, and return needs one Lucene field per structure, all under the same name:
+
+```java
+Document doc = new Document();
+// Exact-match key: one untokenized term, stored so results can return it.
+doc.add(new StringField("id", show.id(), Field.Store.YES));
+// Analyzed full text: postings + positions. Store only what you return.
+doc.add(new TextField("title", show.title(), Field.Store.YES));
+doc.add(new TextField("description", show.description(), Field.Store.NO));
+for (String platform : show.platforms()) {
+  doc.add(new StringField("platforms", platform, Field.Store.YES));            // filter
+  doc.add(new SortedSetDocValuesField("platforms", new BytesRef(platform))); // facet/sort
+}
+doc.add(new IntPoint("release_year", show.releaseYear()));    // BKD tree for ranges
+doc.add(new StoredField("release_year", show.releaseYear())); // value to return
+doc.add(new FloatDocValuesField("rating", show.rating()));    // sort only
+doc.add(new KnnFloatVectorField("embedding", show.embedding(),
+    VectorSimilarityFunction.COSINE));                         // HNSW graph
+
+// Lucene has no primary key. "Upsert" = atomically delete by term, then add.
+writer.updateDocument(new Term("id", show.id()), doc);
+```
+
+Compare one line of a Solr schema:
+
+```xml
+<field name="platforms" type="string" indexed="true" stored="true"
+       docValues="true" multiValued="true"/>
+```
+
+That line is the `StringField(..., Store.YES)` plus `SortedSetDocValuesField` pair above. `indexed`, `stored`, and `docValues` are literally "which Lucene fields should Solr add for this value."
+
+**Step 3 — make changes visible, then durable.**
+
+```java
+searcherManager.maybeRefreshBlocking(); // visible to new searches; not crash-safe
+writer.commit();                        // fsync + new commit point; survives a crash
+```
+
+These two calls are Solr's **soft commit** and **hard commit** (§2.10). Refresh is cheap and makes changes searchable. Commit is expensive and makes them durable. Lucene alone gives you nothing in between: if the process dies after a refresh but before a commit, those documents are gone. Solr closes that gap with its transaction log (§1.6).
+
+**Step 4 — query.** Build a query tree, either by parsing a string or with builders. Then run it and turn internal doc ids back into your data via stored fields:
+
+```java
+Query text = new QueryParser("title", analyzer).parse("crown OR witcher OR stranger");
+Query query = new BooleanQuery.Builder()
+    .add(text, Occur.MUST)                                             // scores
+    .add(new TermQuery(new Term("platforms", "Netflix")), Occur.FILTER) // no score
+    .add(IntPoint.newRangeQuery("release_year", 2016, 2019), Occur.FILTER)
+    .build();
+Sort byRating = new Sort(new SortField("rating", SortField.Type.FLOAT, true));
+
+IndexSearcher searcher = searcherManager.acquire();
+try {
+  TopDocs top = searcher.search(query, 10, byRating);
+  StoredFields stored = searcher.storedFields();
+  for (ScoreDoc hit : top.scoreDocs) {
+    System.out.println(stored.document(hit.doc).get("id"));
+  }
+} finally {
+  searcherManager.release(searcher); // searchers are reference-counted; always release
+}
+```
+
+`MUST` versus `FILTER` is exactly Solr's `q` versus `fq` (§3.1). Filter clauses restrict the match set without contributing to the score. Solr additionally caches each `fq` result as a bitset in the `filterCache`. A vector search is just another `Query`: `new KnnFloatVectorQuery("embedding", queryVector, 20)`, which is what Solr's `{!knn}` parser builds.
+
+The full class, with update, delete, and KNN methods, is `solrbook.lucene.LuceneShowsIndex` in the companion code. `LuceneShowsIndexTest` indexes the §2.3 seed catalog in memory and asserts the behaviour described here: stemming, stop words, filters, sorting, near-real-time refresh, and upsert-by-term.
+
+### What the example made you decide
+
+Even this toy index forced a series of choices that have nothing to do with your business logic:
+
+- **Analysis per field, kept identical on both sides.** Get it wrong and nothing matches. Note also that `EnglishAnalyzer` silently removes stop words like `the`: a search for `the` against eight titles that start with "The" returns nothing.
+- **Which structures to build for each field** — and the knowledge that adding doc values or positions later means rebuilding the index.
+- **An id convention**, because Lucene only knows internal doc ids, and those change when segments merge. Never persist a `ScoreDoc.doc`.
+- **When to refresh and when to commit**, trading freshness against I/O and durability.
+- **Searcher lifecycle**: acquiring and releasing reference-counted searchers, and warming caches before exposing a new one.
+- **Everything outside one JVM**: Lucene has no HTTP API, no replication, no sharding, and no idea that a second machine exists.
+
+The next section is the list of those decisions Solr makes for you, along with the ones it leaves open.
+
+## 1.6 What Solr adds on top of Lucene
+
+Solr's value is not a better inverted index. It *is* Lucene's inverted index. What Solr adds is everything around that index that you would otherwise build, test, and operate yourself:
+
+| You would build with raw Lucene | Solr provides | Book |
+|---|---|---|
+| A network API, a client library, an admin console | HTTP/JSON APIs for every operation, SolrJ, the Admin UI | §2.0, §2.6 |
+| Code that maps your objects to Lucene fields | A declarative schema, Schema API, `copyField`, `dynamicField`; `indexed`/`stored`/`docValues` flags | §2.3 |
+| `Analyzer` subclasses, synonym loading | 100+ configurable tokenizer and filter factories, managed synonyms and stop words, the Analysis screen | §2.4 |
+| Crash recovery between commits | The **update log** (transaction log): replays uncommitted updates after a crash, and serves real-time get | §2.10 |
+| A commit and refresh policy, searcher warming, caches | `autoCommit` / `autoSoftCommit`, warming queries, `filterCache` / `queryResultCache` / `documentCache` | §2.10, §3.1 |
+| Field-level updates | Atomic and in-place updates, built on Lucene's delete-and-add and doc-values updates | §2.8 |
+| Concurrency control | Optimistic locking with `_version_` | §2.8.3 |
+| Query languages for end users | Query parsers: `lucene`, `edismax`, `func`, `knn`, `join`, `collapse`, … | §3.2 |
+| Faceting and aggregations | JSON Facet API, `relatedness()`, pivot and range facets | §3.3 |
+| Search-UX features | Highlighting, spellcheck, suggesters, grouping and collapse, query elevation | §3.7–§3.11, §5.6 |
+| Relevance tooling | `debug=true` / `explain`, learning to rank, text-to-vector models | §3.5, §3.6, §3.10, §5.4 |
+| Scale-out and high availability | Sharding, document routing, replication (NRT/TLOG/PULL), leader election, distributed search, Collections API, ZooKeeper coordination | Chapter 4 |
+| Operations | Authentication and authorization, metrics (OpenTelemetry), backup and restore, the Kubernetes operator | Chapter 4 |
+
+: What Solr layers on top of the Lucene library, and where this book covers each piece. {#tbl-01-solr-over-lucene}
+
+The cost of all this is a separate process (or cluster) to run, an HTTP hop per request, and some loss of control. You configure Lucene through Solr's abstractions rather than calling it directly.
+
+**When raw Lucene is the right call.** Embed Lucene directly when search belongs *inside* one JVM and the data fits on one machine. Examples: full-text search in a desktop application or IDE, an in-process index over a few million records that a single service owns and can rebuild on startup, or a specialised engine you are building yourself, which is how Elasticsearch and OpenSearch started. The moment you need search to survive a node failure, serve more than one application, or scale past one machine, you are rebuilding Solr. Use Solr.
+
+**Lucene knowledge still pays off inside Solr.** Solr's extension points are Lucene types: a custom `QParserPlugin` returns a Lucene `Query`, a `TokenFilterFactory` produces a Lucene `TokenFilter`, and a `SimilarityFactory` produces a Lucene `Similarity`. `debug=true` prints the parsed Lucene query tree (§3.10). When something in Solr surprises you, the explanation is almost always one level down, in the Lucene structures from §1.4.
+
+## 1.7 How each query type actually executes
 
 Now we can walk through the common query types and explain *which files they read* and *why their cost differs*.
 
-### 1.4.1 Term query: `q=platforms:Netflix`
+### 1.7.1 Term query: `q=platforms:Netflix`
 
 The simplest case.
 
@@ -142,15 +343,15 @@ The simplest case.
 
 **Production tip — normalize casing at the source.** For facet/filter fields, lowercase (or otherwise canonicalize) in the ingestion layer *before* sending to Solr. Don't try to fix it with a `solr.LowerCaseFilterFactory`-only field type — that path tokenizes, which breaks exact equality matching used by facets. The right pattern is a `StrField` mirror populated by your application code or a `copyField` from a `KeywordTokenizerFactory` + `LowerCaseFilterFactory` pipeline. Either way, the bytes you index and the bytes you query must match.
 
-### 1.4.2 Boolean query: `q=stranger AND things`, `q=stranger OR things`, `q=stranger NOT love`
+### 1.7.2 Boolean query: `q=stranger AND things`, `q=stranger OR things`, `q=stranger NOT love`
 
-- **AND** = leap-frog intersection of posting lists (§1.3.2). Cost grows with the *smaller* posting list because the smaller one drives the cursor and the larger one gets skipped.
+- **AND** = leap-frog intersection of posting lists (§1.4). Cost grows with the *smaller* posting list because the smaller one drives the cursor and the larger one gets skipped.
 - **OR** = priority-queue merge of posting lists. Cost grows with the *sum* of posting-list sizes.
 - **NOT** = AND with the complement; in practice Lucene uses the same iterator framework and just skips matches.
 
 **Practical implication:** put the most selective clause first if you author the query; the optimizer will reorder when it has stats, but the cheapest disjunction is the one with the smallest combined posting list. In a shows corpus `stranger` (rare title term) is far more selective than `things` (common), so the intersection is driven by the much shorter posting list of `stranger`.
 
-### 1.4.3 Phrase query: `q=title:"stranger things"`
+### 1.7.3 Phrase query: `q=title:"stranger things"`
 
 Now we need *positions*.
 
@@ -161,7 +362,7 @@ Now we need *positions*.
 
 **Cost:** AND intersection cost + position-stream decode per candidate. Phrase is meaningfully more expensive than the underlying AND. **Implication:** index positions only on fields where you need phrase/proximity. The `omitPositions="true"` field-type attribute on `string` and most analytics fields drops `.pos` entirely.
 
-### 1.4.4 Prefix query: `q=title:strang*`
+### 1.7.4 Prefix query: `q=title:strang*`
 
 Prefix queries leverage the fact that the term dictionary is **sorted**.
 
@@ -184,7 +385,7 @@ flowchart LR
 
 > **Production tip — the `maxBooleanClauses` trap.** Solr caps boolean clause counts (default 1024 — since Solr 9 enforced node-wide in `solr.xml` and per-collection in `solrconfig.xml`). Prefix and wildcard queries use a constant-score rewrite *by default*, so they rarely hit the cap; you'll see `TooManyClauses` mainly with scoring rewrites or machine-generated boolean queries. If you legitimately need huge boolean queries, raise the cap deliberately — and know why.
 
-### 1.4.5 Wildcard query: `q=title:t?ings` and the leading-wildcard problem
+### 1.7.5 Wildcard query: `q=title:t?ings` and the leading-wildcard problem
 
 The `*` (any sequence) and `?` (single character) wildcards share the same execution model as prefix queries, but the cost structure depends entirely on **where the wildcard is**.
 
@@ -291,7 +492,7 @@ Indexing `"crown"` with min=3 max=6 produces the tokens `cro`, `crow`, `crown`, 
 
 : Which schema pattern to reach for given the kind of wildcard, substring, or partial-match access you need. {#tbl-01-wildcard-approach}
 
-### 1.4.6 Fuzzy query: `q=title:thinngs~2`
+### 1.7.6 Fuzzy query: `q=title:thinngs~2`
 
 Fuzzy matches all terms within a small edit distance of `thinngs` (a few character insertions, deletions, or substitutions — here the extra `n` is a typo). Internally Lucene uses the term dictionary's sorted structure to enumerate candidate terms efficiently — it does *not* compare against every term one by one. Useful when a user mistypes `breking bad` instead of `breaking bad`.
 
@@ -299,7 +500,7 @@ Fuzzy matches all terms within a small edit distance of `thinngs` (a few charact
 
 If you need misspelling tolerance for *user* input, the spell checker (§3.7) is almost always a better answer than fuzzy queries.
 
-### 1.4.7 Range query: `q=release_year:[2015 TO 2020]`
+### 1.7.7 Range query: `q=release_year:[2015 TO 2020]`
 
 There are two different stories depending on the field type.
 
@@ -309,15 +510,15 @@ There are two different stories depending on the field type.
 
 If you want the data structure behind point fields, search for "Lucene BKD tree".
 
-### 1.4.8 Function queries: `q={!func}recip(ms(NOW,added_at),...)`
+### 1.7.8 Function queries: `q={!func}recip(ms(NOW,added_at),...)`
 
-Function queries don't read the inverted index at all — they read **doc values** (the column-store described in §1.3). The function tree is evaluated per doc, producing a score. Typically used as a `boost` rather than a primary query, because they have no candidate-filtering power (every doc "matches" with some score).
+Function queries don't read the inverted index at all — they read **doc values** (the column-store described in §1.4). The function tree is evaluated per doc, producing a score. Typically used as a `boost` rather than a primary query, because they have no candidate-filtering power (every doc "matches" with some score).
 
-### 1.4.9 Vector (KNN) query: `q={!knn f=embedding topK=20}[...]`
+### 1.7.9 Vector (KNN) query: `q={!knn f=embedding topK=20}[...]`
 
-Vector queries skip the inverted index entirely. They walk the **HNSW graph** (the vector index from §1.3) to find the top-K nearest neighbors to a query vector. Covered conceptually in Chapter 3.
+Vector queries skip the inverted index entirely. They walk the **HNSW graph** (the vector index from §1.4) to find the top-K nearest neighbors to a query vector. Covered conceptually in Chapter 3.
 
-### 1.4.10 Summary: what each query type uses
+### 1.7.10 Summary: what each query type uses
 
 | Query type | What it reads | Notes |
 |---|---|---|
@@ -337,7 +538,7 @@ Vector queries skip the inverted index entirely. They walk the **HNSW graph** (t
 
 Internalizing this table is the difference between guessing about Solr performance and reasoning about it.
 
-## 1.5 BM25 in one paragraph, no math
+## 1.8 BM25 in one paragraph, no math
 
 Each posting contributes a score; the document's score is the sum across query terms. Three intuitive levers control that contribution:
 
@@ -347,7 +548,7 @@ Each posting contributes a score; the document's score is the sum across query t
 
 We revisit BM25 with the actual scoring breakdown in Chapter 3.
 
-## 1.6 When to use Solr vs. SQL vs. a vector DB vs. Postgres FTS
+## 1.9 When to use Solr vs. SQL vs. a vector DB vs. Postgres FTS
 
 | Use case | Pick |
 |---|---|
@@ -362,7 +563,7 @@ We revisit BM25 with the actual scoring breakdown in Chapter 3.
 
 A useful default for greenfield search products in 2026 is: **Solr if you want full Apache 2.0 + first-class faceting + on-prem control; OpenSearch if you want a richer observability ecosystem; Postgres FTS if your search needs are modest and you already have Postgres.**
 
-## 1.7 PostgreSQL Full-Text Search: a brief comparison
+## 1.10 PostgreSQL Full-Text Search: a brief comparison
 
 Postgres ships with real full-text search via `tsvector` and `tsquery`:
 
@@ -383,15 +584,19 @@ This is genuinely good. You get stemming, stop-words, ranking, prefix matching, 
 ## Exercises
 
 1. **Hand-build a posting list.** Take three TV-show titles (any genre, any platform) and produce, by hand: the lowercased tokens for each, the term dictionary (sorted unique terms), and the posting lists with positions. Now answer: which terms have `df=1`? Which would be most diagnostic if a user queried for them?
-2. **Predict the cost.** For each of these queries against a corpus of 50M show records, rank them from cheapest to most expensive *without running them*, and justify your ordering using §1.4: (a) `q=platforms:Netflix`, (b) `q=title:"stranger things"`, (c) `q=title:strang*`, (d) `q=title:*hings`, (e) `q=title:thinngs~2`, (f) `q=release_year:[2015 TO 2020]`. Then, if you have access to a Solr cluster, run them with `debug=timing` and compare your predictions to reality.
-3. **Pick the right tool.** A team wants to add search over a 2-million-row Postgres `episodes` table. Acceptance criteria: support stemming, return results in <200 ms, support boolean queries. Do they need Solr? Justify using §1.6 and §1.7. Now change the requirement to "support 50 simultaneous facet aggregations on genre, platform, release year, and language." Same answer?
+2. **Predict the cost.** For each of these queries against a corpus of 50M show records, rank them from cheapest to most expensive *without running them*, and justify your ordering using §1.7: (a) `q=platforms:Netflix`, (b) `q=title:"stranger things"`, (c) `q=title:strang*`, (d) `q=title:*hings`, (e) `q=title:thinngs~2`, (f) `q=release_year:[2015 TO 2020]`. Then, if you have access to a Solr cluster, run them with `debug=timing` and compare your predictions to reality.
+3. **Pick the right tool.** A team wants to add search over a 2-million-row Postgres `episodes` table. Acceptance criteria: support stemming, return results in <200 ms, support boolean queries. Do they need Solr? Justify using §1.9 and §1.10. Now change the requirement to "support 50 simultaneous facet aggregations on genre, platform, release year, and language." Same answer?
+4. **Schema line to Lucene fields.** For each of these Solr field definitions, list the Lucene field classes Solr must add to a `Document` (use @tbl-01-lucene-components and §1.5): (a) `<field name="id" type="string" indexed="true" stored="true"/>`, (b) `<field name="release_year" type="pint" indexed="true" stored="true" docValues="true"/>`, (c) `<field name="description" type="text_en" indexed="true" stored="false"/>`. Then extend `LuceneShowsIndex` in the companion code to count shows per platform for a query, using the `platforms` doc values. Compare the code you wrote to one line of JSON Facet API (§3.3).
 
-## 1.8 Chapter summary
+## 1.11 Chapter summary
 
+- **Solr is a search server; Lucene is the library inside it.** Lucene owns analysis, the on-disk index, scoring, and vector search. Solr wraps it in HTTP APIs, a declarative schema and config, durability (the update log), caches, query parsers, faceting, and SolrCloud's sharding and replication.
 - Search needs a different data structure than transactional storage. The **inverted index** maps term → docs, which makes multi-term, ranked, language-aware retrieval cheap.
 - A Solr index is built from immutable **segments**. Each segment holds five distinct structures: a sorted **term dictionary**, **postings** (sorted doc-id lists per term, with skip lists for fast intersection), **doc values** (a column-store for sorting/faceting/function queries), **stored fields** (compressed verbatim copies for retrieval), and a **vector index** (HNSW graph for KNN).
 - Different query types touch different subsets of these structures. Knowing which structure each query reads is the foundation of reasoning about performance.
 - Solr's value over `LIKE '%...%'` is not "faster substring search" — it is fundamentally different semantics (relevance, language, facets) backed by a fundamentally different storage model.
 - Postgres FTS is a real option for small-to-medium loads; Solr/OpenSearch/Elasticsearch are the right answer when you need scale, facets, or hybrid vector + lexical retrieval.
+- Lucene's Java API comes down to a handful of types: `Directory`, `Analyzer`, `Document` and field classes, `IndexWriter`, `IndexSearcher` / `SearcherManager`, and `Query`. A Solr field's `indexed` / `stored` / `docValues` flags choose which Lucene fields get added. Soft and hard commits are Lucene's refresh and `commit()`. `q` and `fq` are `MUST` and `FILTER` clauses.
+- Embed raw Lucene only for single-JVM search you are happy to own end to end. Anything that must be shared, survive failures, or scale out is what Solr is for.
 
 ---

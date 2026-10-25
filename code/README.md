@@ -20,6 +20,7 @@ The integration tests pull the Docker Official Image `solr:10.0.0` on first run.
 
 | Package / class | Book section | What it shows |
 |---|---|---|
+| `solrbook.lucene.LuceneShowsIndex` | §1.5 | The shows catalog indexed and searched with plain Lucene (no Solr): per-field analyzers, one logical field → several Lucene fields, NRT refresh vs. commit, `FILTER` clauses, doc-values sort, KNN |
 | `solrbook.indexing.Show`, `SeedCatalog` | §2.3 | The 30-show seed catalog every example draws from |
 | `solrbook.indexing.ShowsSchema` | §2.3 | The shows schema built with the Schema API (field types, copyFields, in-place-update fields, `DenseVectorField`) |
 | `solrbook.indexing.ShowIndexer` | §2.6 | Batched indexing and `ConcurrentUpdateJettySolrClient` fire-and-forget indexing |
@@ -40,7 +41,8 @@ The integration tests pull the Docker Official Image `solr:10.0.0` on first run.
 ## Tests
 
 - **Unit tests** (`./gradlew test`) — pure-JVM tests for the fusion/metric/expression
-  logic. `RrfTest` reproduces the book's §3.6 worked RRF example digit for digit, and
+  logic, plus `LuceneShowsIndexTest`, which runs the §1.5 plain-Lucene examples against an
+  in-memory index. `RrfTest` reproduces the book's §3.6 worked RRF example digit for digit, and
   `NdcgTest` checks the §5.1 formula against hand-computed values.
 - **Integration tests** (`./gradlew integrationTest`, JUnit tag `integration`) — start a
   real Solr 10 in Docker (one shared container for the whole suite), build the schema via

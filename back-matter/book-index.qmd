@@ -21,7 +21,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 - backup and restore, *not covered — see References for Apache docs*
 - batch indexing, **§2.6**
-- BM25 similarity, **§3.5**; default since Solr 6, §3.5; intuition, §1.5; parameters (`k1`, `b`), §3.5
+- BM25 similarity, **§3.5**; default since Solr 6, §3.5; intuition, §1.8; parameters (`k1`, `b`), §3.5
 - block-join queries, mentioned in §2.8.4
 - blue/green reindex, **§2.9.3**
 - boost, eDisMax parameter, **§3.2**; multiplicative vs. additive (`bq` vs. `boost`), §3.2; signals, §5.3
@@ -58,13 +58,14 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 - debugging queries (`debug=true`, `[explain]`), **§3.10**
 - deep paging, §3.1 — see also *cursorMark*
-- deletes (soft, live-docs bitset), §1.3
+- deletes (soft, live-docs bitset), §1.4
 - DenseVectorField, **§3.6**; quantized variants, §3.6; `cagra_hnsw` (GPU), §3.6
 - `{!vectorSimilarity}` parser, §3.6
 - diagram conventions, *Preface — Diagrams*
+- Directory (Lucene), **§1.5**; `directoryFactory`, §1.5
 - DisMax, §3.2
 - distributed query flow, **§4.9**
-- doc values, **§1.3**; required for sort/facet, §2.3; required for in-place updates, §2.8.2
+- doc values, **§1.4**; required for sort/facet, §2.3; required for in-place updates, §2.8.2
 - Docker image (Docker Official Image `solr`), §2.7
 - document routing, **§4.5**
 - dynamicField, **§2.5**
@@ -84,10 +85,10 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - feature logging (LTR), §5.4
 - feature store (LTR), §5.4
 - field properties (`indexed`, `stored`, `docValues`, …), **§2.3**
-- field types (`StrField`, `TextField`, point types), §2.3, §1.4.1
+- field types (`StrField`, `TextField`, point types), §2.3, §1.7.1
 - filter query (`fq`), **§3.1**; caching, §3.1; post-filters and `cost`, §3.1
-- five data structures in a Lucene segment, **§1.3**
-- function queries, **§3.5**; doc-values backed, §1.4.8
+- five data structures in a Lucene segment, **§1.4**
+- function queries, **§3.5**; doc-values backed, §1.7.8
 
 ### G
 
@@ -106,13 +107,15 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 ### I
 
-- IDF (Inverse Document Frequency), §1.5, §3.5
+- IDF (Inverse Document Frequency), §1.8, §3.5
 - in-place updates, **§2.8.2**; `update.partial.requireInPlace=true`, §2.8.2; criteria, §2.8.2
 - index, inverted — see *inverted index*
 - index conventions for this book, *Preface*
 - index-time vs. query-time analyzer, §2.4, §2.9.2
 - index-time vs. query-time boosting, §5.3
-- inverted index, **§1.2**, **§1.3**
+- IndexSearcher (Lucene), **§1.5**
+- IndexWriter (Lucene), **§1.5**; refresh vs. `commit()`, §1.5
+- inverted index, **§1.3**, **§1.4**
 - ISBN, *Copyright and edition*
 
 ### J
@@ -127,7 +130,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 ### K
 
-- `k1` parameter (BM25), **§3.5**, §1.5 (inverse intuition)
+- `k1` parameter (BM25), **§3.5**, §1.8 (inverse intuition)
 - KNN — see *vector search*
 - Kubernetes (Solr Operator), **§4.12**
 
@@ -136,18 +139,21 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - LatestVersionMergePolicyFactory, §2.11
 - leader election (SolrCloud), **§4.6**
 - learning to rank (LTR), **§5.4**; `LinearModel`, §5.4; `MultipleAdditiveTreesModel`, §5.4
-- length normalization (BM25 `b`), §1.5, §3.5
+- length normalization (BM25 `b`), §1.8, §3.5
 - licensing comparison, **§7.2**
 - LinearModel, §5.4
 - live_nodes (ZooKeeper), §4.2
 - logging clicks, §5.2
-- Lucene 10.3, §4.1
-- Lucene file formats reference, §1.3, *References*
+- Lucene 10.3, §1.1, §4.1
+- Lucene, embedding directly (when to), **§1.6**
+- Lucene file formats reference, §1.4, *References*
+- Lucene Java API, **§1.5**; components table, §1.5; dependencies, §1.5
+- Lucene vs. Solr, **§1.1**, **§1.6**
 
 ### M
 
 - managed schema, **§2.2**
-- maxBooleanClauses, §1.4.4
+- maxBooleanClauses, §1.7.4
 - MART (Multiple Additive Trees), §5.4
 - MCP — see *Model Context Protocol*
 - measurement (NDCG, MRR, MAP), **§5.1**
@@ -161,10 +167,10 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 ### N
 
-- n-gram fields, §1.4.5
+- n-gram fields, §1.7.5
 - NDCG@k, **§5.1**; SolrJ implementation, §5.1
 - nested documents (block-join), §2.8.4
-- normalize casing on ingest, §1.4.1
+- normalize casing on ingest, §1.7.1
 - NRT replica type, **§4.4**
 
 ### O
@@ -182,10 +188,10 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - partial updates — see *atomic updates*, *in-place updates*
 - placement plugins, **§4.11**; `SimplePlacementFactory` is the default, §4.11
 - post-filter (`cost>=100`), **§3.1**; Collapse as a post-filter, §3.9
-- positions (in postings), §1.3, §1.4.3
-- Postgres FTS comparison, **§1.7**
-- postings, **§1.3**; intersection (AND), §1.4.2
-- prefix query, **§1.4.4**; max boolean clauses, §1.4.4
+- positions (in postings), §1.4, §1.7.3
+- Postgres FTS comparison, **§1.10**
+- postings, **§1.4**; intersection (AND), §1.7.2
+- prefix query, **§1.7.4**; max boolean clauses, §1.7.4
 - PULL replica type, **§4.4**
 
 ### Q
@@ -198,14 +204,14 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 ### R
 
-- range query, **§1.4.7**
+- range query, **§1.7.7**
 - read-modify-write (optimistic concurrency), §2.8.3
 - Real-Time Get (RTG), §4.4 (NRT), §2.8.3
 - Reciprocal Rank Fusion (RRF), **§3.6**; client-side fallback, §3.6; native (SOLR-17319), §3.6
 - reindexing, **§2.9**; when required, §2.9.1; when not, §2.9.2; blue/green, §2.9.3; REINDEXCOLLECTION command, §2.9.3
 - relatedness() aggregation, **§5.5**
 - replica types (NRT, TLOG, PULL), **§4.4**
-- ReversedWildcardFilterFactory, §1.4.5
+- ReversedWildcardFilterFactory, §1.7.5
 - rolling commit policy, §2.10
 - routing — see *compositeId routing*
 
@@ -218,7 +224,8 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - `shards.tolerant` / `partialResults`, §3.1
 - `security.json`, **§4.13**
 - seed dataset (the 30-show table), **§2.3**
-- segment, Lucene, **§1.3**, §2.11
+- SearcherManager (Lucene NRT), §1.5
+- segment, Lucene, **§1.4**, §2.11
 - semantic knowledge graph — see *`relatedness()` aggregation*
 - `set` modifier (atomic update), §2.8.1
 - `setNull` (clear field), §2.8.1
@@ -234,32 +241,34 @@ The index is alphabetical by topic; bold entries point to the section where a co
 - SSL/TLS (`SOLR_SSL_*`), §4.13
 - soft commit, **§2.10**
 - SolrCloud, **Chapter 4**; default in Solr 10, §4.1
+- Solr, what it is, **§1.1**; history, §1.1, §7.1; what it adds over Lucene, **§1.6**
 - SolrJ (Maven coordinates, artifacts), §2.6
 - SolrContainer (Testcontainers), §2.7
 - spell checking, **§3.7**
 - standalone mode (`--user-managed`), §4.1
-- StrField case sensitivity, **§1.4.1**
+- StrField case sensitivity, **§1.7.1**
 - Streaming Expressions, §5.2 (rollup, update, select)
 - SuggestComponent, **§3.11.1**
 - synonyms (query-time vs. index-time), §2.4, §2.9.2
 
 ### T
 
-- term dictionary, **§1.3**; FST term index, §1.3
-- term frequency (TF), §1.5, §3.5
+- term dictionary, **§1.4**; FST term index, §1.4
+- term frequency (TF), §1.8, §3.5
 - Testcontainers, **§2.7**
 - `timeAllowed`, §3.1, §3.11.2
-- TF saturation (`k1`), §1.5
+- TF saturation (`k1`), §1.8
 - text analyzer chain, **§2.4**
 - time-routed aliases, *not covered*
 - TLOG replica type, **§4.4**
 - tlog (transaction log), §2.10
 - tokenizer, §2.4
-- TooManyClauses (prefix query rewrite), §1.4.4
+- TooManyClauses (prefix query rewrite), §1.7.4
 
 ### U
 
 - uniqueKey, **§2.3**, §3.9 (Collapse)
+- update log (transaction log), §1.6, §2.10
 - update modifiers — see *atomic updates*
 - update.partial.requireInPlace, **§2.8.2**
 
@@ -272,7 +281,7 @@ The index is alphabetical by topic; bold entries point to the section where a co
 
 ### W
 
-- wildcard query, **§1.4.5**; embedded vs. leading, §1.4.5; n-gram alternative, §1.4.5
+- wildcard query, **§1.7.5**; embedded vs. leading, §1.7.5; n-gram alternative, §1.7.5
 
 ### Z
 

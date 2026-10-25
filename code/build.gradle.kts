@@ -16,6 +16,8 @@ repositories {
 }
 
 val solrVersion = "10.0.0"
+// The Lucene release Solr 10.0.0 is built on — §1.5 uses Lucene directly.
+val luceneVersion = "10.3.2"
 val testcontainersVersion = "1.21.4"
 
 dependencies {
@@ -24,6 +26,11 @@ dependencies {
     // Jetty-based clients: HttpJettySolrClient, ConcurrentUpdateJettySolrClient,
     // and the transport CloudSolrClient prefers when Jetty is on the classpath.
     implementation("org.apache.solr:solr-solrj-jetty:$solrVersion")
+
+    // Plain Lucene, no Solr: the embedded-library examples in §1.5.
+    implementation("org.apache.lucene:lucene-core:$luceneVersion")
+    implementation("org.apache.lucene:lucene-analysis-common:$luceneVersion")
+    implementation("org.apache.lucene:lucene-queryparser:$luceneVersion")
 
     implementation("org.slf4j:slf4j-api:2.0.17")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.17")
