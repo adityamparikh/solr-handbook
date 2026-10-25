@@ -30,7 +30,7 @@ solr-handbook/
 ├── _quarto.yml              # book config — chapters, formats, crossref settings
 ├── index.qmd                # preface (book home page)
 ├── chapters/
-│   ├── 01-why-solr.qmd      # inverted index, Lucene internals, query cost model
+│   ├── 01-why-solr.qmd      # what Solr is, inverted index, Lucene internals + Java API, query cost model
 │   ├── 02-indexing.qmd      # schema, analyzers, SolrJ, partial updates, reindex
 │   ├── 03-search.qmd        # eDisMax, faceting, vector / HNSW, RRF
 │   ├── 04-solrcloud.qmd     # ZooKeeper, leader election, recovery, Kubernetes

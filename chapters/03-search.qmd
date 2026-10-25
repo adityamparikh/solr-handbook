@@ -251,7 +251,7 @@ QueryResponse resp = req.process(client, "shows");
 
 : A cheat sheet of the eight common matching idioms — exact, prefix, wildcard, fuzzy, phrase, slop, range, boolean — with the literal query syntax for each. {#tbl-03-matching-cheatsheet}
 
-The execution costs of each of these are covered in detail in §1.4. The short version: wildcards and leading-wildcards are slow; fuzzy queries are slower. If you need spelling tolerance, prefer the Spell Checker (§3.7) or an n-gram field. If you need leading-wildcard, use `ReversedWildcardFilterFactory` at index time.
+The execution costs of each of these are covered in detail in §1.7. The short version: wildcards and leading-wildcards are slow; fuzzy queries are slower. If you need spelling tolerance, prefer the Spell Checker (§3.7) or an n-gram field. If you need leading-wildcard, use `ReversedWildcardFilterFactory` at index time.
 
 ## 3.5 Relevance scoring — BM25 in honest detail
 

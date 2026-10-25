@@ -2,7 +2,7 @@
 
 > **What this chapter covers and why it matters.** Indexing is where most production search problems are actually born — bad schemas, bad analysis chains, bad partial-update strategies, and risky reindexing patterns cause most of the relevance and performance fires you will fight. This chapter starts with the user-facing unit of data in Solr (the collection), then walks through schema design, field types, analyzers, SolrJ bulk indexing, the three flavors of partial update (full replace, atomic, in-place), zero-downtime reindexing patterns, and the commit model.
 >
-> **Prerequisites:** Chapter 1 — specifically §1.3 (the five data structures) and §1.4 (which structure each query type reads). You will not get the field-property tradeoffs without it.
+> **Prerequisites:** Chapter 1 — specifically §1.4 (the five data structures) and §1.7 (which structure each query type reads). You will not get the field-property tradeoffs without it.
 >
 > **You will learn:** How to design a Solr schema that you won't regret in six months, how the analyzer chain transforms text at index and query time, how to index from Java with SolrJ at production throughput, how to test against a real Solr with Testcontainers, when to use atomic vs. in-place updates and the trap of silently falling back, how to do zero-downtime reindexes with collection aliases, and how to think about commits.
 >

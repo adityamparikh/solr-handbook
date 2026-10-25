@@ -22,7 +22,7 @@ It is **not** written for:
 
 Chapters 1–4 build on each other and are best read in order. Chapters 5–7 stand alone once that spine is in place.
 
-- **[Chapter 1 — Why Solr](chapters/01-why-solr.qmd)** establishes why a B-tree over `VARCHAR` is the wrong tool for full-text search, walks through the inverted index as it actually lives on disk in a Lucene segment, and ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
+- **[Chapter 1 — What Is Solr, and Why?](chapters/01-why-solr.qmd)** defines Solr as a search server built on the Lucene library and establishes why a B-tree over `VARCHAR` is the wrong tool for full-text search. It walks through the inverted index as it actually lives on disk in a Lucene segment, shows the core Lucene Java API and what Solr layers on top of it, and ends with a decision framework: Solr vs. SQL vs. a vector database vs. PostgreSQL FTS.
 - **[Chapter 2 — Indexing](chapters/02-indexing.qmd)** covers the schema (managed-schema, field types, `copyField`, `dynamicField`, `docValues`, multivalued and dynamic fields), the SolrJ indexing path, partial updates with optimistic concurrency, reindexing strategy, hard vs. soft commits, and segment merging.
 - **[Chapter 3 — Search](chapters/03-search.qmd)** is the query layer: request handlers, queries vs. filters and the caches behind them, post-filters, pagination that survives depth, the Standard / DisMax / eDisMax parsers, field and range facets (JSON Facet API), BM25 in honest detail, vector and hybrid retrieval, suggesters, highlighting, collapse/expand, and how to debug a slow request.
 - **[Chapter 4 — SolrCloud](chapters/04-solrcloud.qmd)** is the distributed runtime: ZooKeeper, shards, NRT/TLOG/PULL replicas, document routing, leader election, the Collections API, the Apache Solr Operator on Kubernetes, and monitoring.
@@ -34,7 +34,7 @@ Each chapter opens with a callout box listing its prerequisites and what you wil
 
 ## Companion code
 
-Every load-bearing example in this book exists as **runnable, tested Java code** in the [`code/` directory of the book's repository](https://github.com/adityamparikh/solr-handbook/tree/main/code): a Gradle project targeting Solr 10.0.0 and SolrJ 10.0.0 on Java 21. It contains the 30-show seed catalog from §2.3, the schema built via the Schema API, the indexing/partial-update/reindex patterns from Chapter 2, the eDisMax/facet/vector/RRF code from Chapter 3, and the NDCG and signals-boosting implementations from Chapter 5.
+Every load-bearing example in this book exists as **runnable, tested Java code** in the [`code/` directory of the book's repository](https://github.com/adityamparikh/solr-handbook/tree/main/code): a Gradle project targeting Solr 10.0.0 and SolrJ 10.0.0 on Java 21. It contains the plain-Lucene shows index from §1.5, the 30-show seed catalog from §2.3, the schema built via the Schema API, the indexing/partial-update/reindex patterns from Chapter 2, the eDisMax/facet/vector/RRF code from Chapter 3, and the NDCG and signals-boosting implementations from Chapter 5.
 
 ```bash
 git clone https://github.com/adityamparikh/solr-handbook.git
